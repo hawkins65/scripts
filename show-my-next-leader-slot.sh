@@ -1,6 +1,6 @@
 #!/bin/bash
 
-VALIDATOR_IDENTITY=Tri1F8B6YtjkBztGCwBNSLEZib1EAqMUEUM7dTT7ZG3
+VALIDATOR_IDENTITY=<your-identity-pubkey>
 
 TIME_ZONE="America/Chicago"
 
