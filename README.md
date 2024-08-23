@@ -13,10 +13,11 @@ the script fetches performance samples from the solana network to calculate the 
 bash show-my-next-leader-slot.sh
 ```
 to use the script, you need to modify the three variables at top of the script:
+```
 VALIDATOR_IDENTITY
 TIME_ZONE
 RPC_URL
-
+```
 ## packages
 install the required packages: bc and jq
 
@@ -28,7 +29,7 @@ apt install bc jq -y
 ```
 bash show-my-next-leader-slot.sh
 
-
+```
 Upcoming Leader Slots
 Lead  285365600-285365603  4 slots       2024-08-23 15:06:46 UTC | 2024-08-23 10:06:46 America/Chicago (1.76 secs)
       285365604-285368927  3324 slots    2024-08-23 15:06:47 UTC | 2024-08-23 10:06:47 America/Chicago (24 mins 26.47 secs)
@@ -57,3 +58,4 @@ Time of next leader slot (UTC): 2024-08-23 15:07:00 UTC ***** Time of next leade
 - added a table at the top of the output to show next 4 leaderslots
 - added variables TIME_ZONE and RPC_URL
 - Updated the sumamry output
+```
