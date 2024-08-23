@@ -28,7 +28,7 @@ apt install bc jq -y
 ## example output
 ```
 bash show-my-next-leader-slot.sh
-
+```
 Upcoming Leader Slots
 Lead  285365600-285365603  4 slots       2024-08-23 15:06:46 UTC | 2024-08-23 10:06:46 America/Chicago (1.76 secs)
       285365604-285368927  3324 slots    2024-08-23 15:06:47 UTC | 2024-08-23 10:06:47 America/Chicago (24 mins 26.47 secs)
