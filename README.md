@@ -29,7 +29,6 @@ apt install bc jq -y
 ```
 bash show-my-next-leader-slot.sh
 
-```
 Upcoming Leader Slots
 Lead  285365600-285365603  4 slots       2024-08-23 15:06:46 UTC | 2024-08-23 10:06:46 America/Chicago (1.76 secs)
       285365604-285368927  3324 slots    2024-08-23 15:06:47 UTC | 2024-08-23 10:06:47 America/Chicago (24 mins 26.47 secs)
@@ -51,7 +50,7 @@ Average slot duration: .441176 seconds (441.176000 milliseconds)
 Your next leader slot is at slot 285365600 for VALIDATOR_IDENTITY = <your-identity-pubkey>
 Time of next leader slot (UTC): 2024-08-23 15:07:00 UTC ***** Time of next leader slot (America/Chicago): 2024-08-23 10:07:00 CDT
 ***** in approximately 0 hours, 2 minutes, 13 seconds *****
-```
+
 
 ## changelog
 2024-08-23
