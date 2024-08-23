@@ -56,6 +56,7 @@ Time of next leader slot (UTC): 2024-08-23 15:07:00 UTC ***** Time of next leade
 
 ## changelog
 2024-08-23
+- changed status.sh to show-my-next-leaderslot.sh
 - added a table at the top of the output to show next 4 leaderslots
 - added variables TIME_ZONE and RPC_URL
 - Updated the summary output
