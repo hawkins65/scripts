@@ -1,0 +1,27 @@
+# Example ~/.config/validator/rpc.conf
+#
+# Several scripts here read their RPC endpoints and validator identity from this
+# file. Copy it into place and fill in your own values:
+#
+#   mkdir -p ~/.config/validator
+#   cp validator-rpc.conf.example ~/.config/validator/rpc.conf
+#   chmod 600 ~/.config/validator/rpc.conf
+#
+# Keep it at mode 600 and OUT of version control. A paid RPC URL carries its
+# credential inside the path, so the whole URL is a secret — treat any file
+# holding one the way you would treat a private key.
+
+# ── RPC endpoints ────────────────────────────────────────────────────────────
+# Any JSON-RPC endpoint works. The public ones below are rate-limited; use your
+# own provider for anything that polls.
+MAINNET_RPC_URL="https://api.mainnet-beta.solana.com"
+MAINNET_RPC_URL_ALT="https://api.mainnet-beta.solana.com"
+TESTNET_RPC_URL="https://api.testnet.solana.com"
+
+# ── Validator identity ───────────────────────────────────────────────────────
+VALIDATOR_IDENTITY="YOUR_VALIDATOR_IDENTITY_PUBKEY"
+VALIDATOR_IDENTITY_KEYPAIR="/home/sol/identity.json"
+VOTE_ACCOUNT="YOUR_VOTE_ACCOUNT_PUBKEY"
+
+# Optional: a second identity some scripts can switch to.
+COGENT_IDENTITY=""

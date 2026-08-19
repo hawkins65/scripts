@@ -1,0 +1,18 @@
+# Never commit a filled-in config. Any *.example file is the template; the real
+# one lives outside the repo (see validator-rpc.conf.example for the pattern).
+.env
+.env.*
+!.env.example
+*.secrets.env
+!*.secrets.env.example
+rpc.conf
+validator-rpc.conf
+!validator-rpc.conf.example
+
+# Runtime / build artifacts
+node_modules/
+__pycache__/
+*.pyc
+*.log
+*.bak
+*.bak-*
