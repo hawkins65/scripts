@@ -113,8 +113,10 @@ B58_RE='^[1-9A-HJ-NP-Za-km-z]{32,44}$'
 # the queue; SOLANA_URL (if set) still wins for what the CLI submits through.
 RPC_POOL=()
 [[ -n "${RPC_URL_OVERRIDE:-}" ]] && RPC_POOL+=("$RPC_URL_OVERRIDE")
+# MAINNET_3 and COGENT were removed 2026-08-19: COGENT was deleted at the
+# provider on 08-12, and MAINNET_3 is IP-restricted to a single host, so from
+# anywhere else it only adds a guaranteed-failing entry to the failover pool.
 for _v in HELIUS_RPC_URL QUICKNODE_RPC_URL QUICKNODE_MAINNET_2_RPC_URL \
-          QUICKNODE_MAINNET_3_RPC_URL QUICKNODE_COGENT_RPC_URL \
           ALCHEMY_RPC_URL TRITON_RPC_URL; do
     [[ -n "${!_v:-}" ]] && RPC_POOL+=("${!_v}")
 done
