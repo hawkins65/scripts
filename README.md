@@ -57,6 +57,7 @@ epoch is normal, not a fault.
 
 | Script | What it does |
 |---|---|
+| `validator-monitor.sh` | Live terminal dashboard for an Agave/Jito node — vote reception, CPU and memory, network errors, shred latency, block build time, DoubleZero and shredstream health |
 | `my-leader-slots.sh` | List your leader slots for the current epoch |
 | `show-my-next-leader-slot.sh` | Time until your next leader slot |
 | `validator-monitor-credits.sh` | Track vote credits and flag shortfalls |
@@ -64,6 +65,19 @@ epoch is normal, not a fault.
 | `collect-identity-balance.sh` | Record identity account balance over time |
 | `pubkey-to-name.sh` | Resolve a vote account to a validator name via the Trillium API |
 | `epoch-run-once.sh` | Run a set of jobs once per epoch, at the boundary |
+
+`validator-monitor.sh` reads the validator's own JSON-RPC endpoint, its log, and
+local sources (filesystem, the `doublezerod` socket, systemd). It shells out to
+no `solana` CLI and depends on no public RPC. It derives the log path from the
+validator's `--log` flag rather than assuming one, which matters on hosts where
+`/home/sol/logs` is a symlink into the ledger mount.
+
+Its warning thresholds — especially `VOTE_RX_WARN` — were calibrated on specific
+hardware and stake. The comments explain the method; recalibrate on your own
+nodes instead of adopting the numbers as-is. Vote reception in particular is a
+useful *leading* indicator: it drops the moment a host returns degraded, hours
+before that host is next leader and under-packs, while every ordinary liveness
+check stays green.
 
 ## CPU and performance
 
