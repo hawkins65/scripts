@@ -29,25 +29,92 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# ---- Config (verified against live --log/--ledger/--snapshots on 2026-05-19) ----
 RPC_URL="${RPC_URL:-http://127.0.0.1:8899}"
-# The validator's own --log flag is authoritative, so derive the path instead
-# of assuming it. Two layouts are common and they look identical until they
-# don't: a host that logs to /mnt/ledger/logs/validator.log may match the
-# historical /home/sol/logs default only because the latter is a symlink to it.
-# Rebuild that host and the symlink is gone, and the monitor silently reads
-# nothing — no error, just empty metrics. Other hosts declare
-# /home/sol/logs/validator.log directly. Deriving covers both with no per-host
-# branch.
-_derive_log_file() {
-    local f="$HOME/validator.sh" p=""
-    [ -f "$f" ] && p=$(grep -oE -- '--log[= ]+[^ \\]+' "$f" 2>/dev/null | head -1 | sed -E 's/^--log[= ]+//')
-    [ -n "$p" ] && printf '%s' "$p" || printf '%s' "/home/sol/logs/validator.log"
-}
-LOG_FILE="${LOG_FILE:-$(_derive_log_file)}"
 LEDGER_DIR="${LEDGER_DIR:-/mnt/ledger}"
 SNAPSHOT_DIR="${SNAPSHOT_DIR:-/mnt/accounts1/snapshots}"
 SERVICE_NAME="${SERVICE_NAME:-sol}"
+SHREDSTREAM_UNIT="${SHREDSTREAM_UNIT:-jito-shredstream.service}"
+DOUBLEZERO_UNIT="${DOUBLEZERO_UNIT:-doublezerod.service}"
+DZ_SOCKET="${DZ_SOCKET:-/run/doublezerod/doublezerod.sock}"
+VALIDATOR_START_SCRIPT="${VALIDATOR_START_SCRIPT:-$HOME/validator.sh}"
+LOG_FILE_FALLBACK="${LOG_FILE_FALLBACK:-/home/sol/logs/validator.log}"
+
+# ---- Log source: a file, or journald ----
+#
+# Not every operator runs with --log. Plenty let the validator write to stdout
+# and read it back with journalctl, in which case there is no log file at all.
+# Both are supported:
+#
+#   LOG_SOURCE=file      read $LOG_FILE
+#   LOG_SOURCE=journal   read journalctl -u $LOG_UNIT
+#   LOG_SOURCE=auto      (default) pick one, see below
+#
+# When a --log path IS declared, prefer the file: journald may be rate-limiting
+# (RateLimitBurst) and silently dropping the very datapoint lines this monitor
+# counts, whereas the file the validator writes itself is complete.
+#
+# Deriving the path beats assuming it. Two layouts look identical until they
+# don't: a host logging to /mnt/ledger/logs/validator.log may match the
+# historical /home/sol/logs default only because the latter is a symlink to it.
+# Rebuild that host, the symlink is gone, and the monitor silently reads
+# nothing — no error, just empty metrics.
+_derive_log_file() {
+    local f="$VALIDATOR_START_SCRIPT" p=""
+    [ -f "$f" ] && p=$(grep -oE -- '--log[= ]+[^ \\]+' "$f" 2>/dev/null | head -1 | sed -E 's/^--log[= ]+//')
+    printf '%s' "${p:-$LOG_FILE_FALLBACK}"
+}
+LOG_FILE="${LOG_FILE:-$(_derive_log_file)}"
+LOG_UNIT="${LOG_UNIT:-$SERVICE_NAME}"
+LOG_SOURCE="${LOG_SOURCE:-auto}"
+if [ "$LOG_SOURCE" = auto ]; then
+    if [ -r "$LOG_FILE" ]; then
+        LOG_SOURCE=file
+    elif command -v journalctl >/dev/null 2>&1 \
+         && [ -n "$(journalctl -u "$LOG_UNIT" -n 1 --no-pager -o cat 2>/dev/null)" ]; then
+        # Test for OUTPUT, not exit status: journalctl exits 0 for a unit that
+        # has never logged anything, so a status check would happily select
+        # journald for a unit name that does not exist.
+        LOG_SOURCE=journal
+    else
+        LOG_SOURCE=file   # nothing readable either way; downstream shows empty
+    fi
+fi
+
+# Service state: active | inactive | failed | absent.
+#
+# `systemctl is-active` reports a unit that does not exist as "inactive", which
+# is indistinguishable from one that is installed and stopped. That matters
+# here: the Jito and DoubleZero units are optional, and treating "not installed"
+# as "down" would leave a plain Agave node permanently red with two phantom
+# issues.
+_svc_state() {
+    if ! systemctl list-unit-files "$1" --no-legend 2>/dev/null | grep -q . \
+       && ! systemctl list-units --all "$1" --no-legend 2>/dev/null | grep -q .; then
+        printf 'absent'
+        return
+    fi
+    systemctl is-active "$1" 2>/dev/null
+}
+
+# Last N lines, oldest first — the same order `tail` gives.
+_log_tail() {
+    if [ "$LOG_SOURCE" = journal ]; then
+        journalctl -u "$LOG_UNIT" -n "$1" --no-pager -o cat 2>/dev/null
+    else
+        tail -n "$1" "$LOG_FILE" 2>/dev/null
+    fi
+}
+
+# Newest line matching a pattern, scanning backwards. $1=pattern $2=timeout secs.
+# The timeout is load-bearing in file mode: `tac` on a multi-GB log with no match
+# walks the entire file. journald gets the same guard for the same reason.
+_log_rscan() {
+    if [ "$LOG_SOURCE" = journal ]; then
+        timeout "$2" journalctl -u "$LOG_UNIT" -r --no-pager -o cat 2>/dev/null | grep -m1 "$1"
+    else
+        timeout "$2" tac "$LOG_FILE" 2>/dev/null | grep -m1 "$1"
+    fi
+}
 IDENTITY_PUBKEY="${IDENTITY_PUBKEY:-}"      # auto-detected via getIdentity if empty
 
 # Resolve VOTE_PUBKEY: env > rpc.conf VOTE_ACCOUNT
@@ -478,7 +545,7 @@ while true; do
     slot_ms_target=$(awk -v d="$SLOT_DURATION_DEFAULT" 'BEGIN{printf "%.0f", d*1000}')
 
     # ---- Log tail: grab the most recent N lines once ----
-    log_tail=$(tail -n "$LOG_TAIL_LINES" "$LOG_FILE" 2>/dev/null)
+    log_tail=$(_log_tail "$LOG_TAIL_LINES")
 
     # Latest new root from stock-agave replay_stage:
     #   solana_core::replay_stage] new fork:N parent:N root:SLOT
@@ -612,8 +679,8 @@ while true; do
             # tac walks the ENTIRE file. Seen in practice: a freshly promoted
             # host with a 23 GB log containing zero of these datapoints hung the
             # whole monitor here — header printed, then nothing, no error.
-            cached_build_line=$(timeout "$BUILD_SCAN_TIMEOUT_S" tac "$LOG_FILE" 2>/dev/null \
-                | grep -m1 'datapoint: leader-slot-start-to-cleared-elapsed-ms ')
+            cached_build_line=$(_log_rscan 'datapoint: leader-slot-start-to-cleared-elapsed-ms ' \
+                                  "$BUILD_SCAN_TIMEOUT_S")
         fi
         leader_elapsed_line=$cached_build_line
         build_from_history=1
@@ -746,8 +813,8 @@ while true; do
 
     # --- Service status ---
     svc_sol=$(systemctl is-active "$SERVICE_NAME" 2>/dev/null)
-    svc_shred=$(systemctl is-active jito-shredstream.service 2>/dev/null)
-    svc_dz=$(systemctl is-active doublezerod.service 2>/dev/null)
+    svc_shred=$(_svc_state "$SHREDSTREAM_UNIT")
+    svc_dz=$(_svc_state "$DOUBLEZERO_UNIT")
 
     # --- Leader schedule (refetch only on epoch boundary) ---
     # Look up under the STAKED identity — the local (possibly hot-spare) identity
@@ -831,7 +898,7 @@ while true; do
     # --- DoubleZero (slow refresh) ---
     if [ $((now_epoch - last_slow_refresh)) -ge "$SLOW_REFRESH" ]; then
         last_slow_refresh=$now_epoch
-        dz_json=$(curl -s --connect-timeout 2 --unix-socket /run/doublezerod/doublezerod.sock http://localhost/status 2>/dev/null)
+        dz_json=$(curl -s --connect-timeout 2 --unix-socket "$DZ_SOCKET" http://localhost/status 2>/dev/null)
         if [ -n "$dz_json" ] && echo "$dz_json" | jq -e . >/dev/null 2>&1; then
             cached_dz_tunnels=$(echo "$dz_json" | jq -r --argjson now "$now_epoch" '
                 map(
@@ -963,8 +1030,9 @@ while true; do
 
     svc_icon="🟢"
     [ "$svc_sol"   != "active" ] && svc_icon="🔴"
-    [ "$svc_shred" != "active" ] && svc_icon="🔴"
-    [ "$svc_dz"    != "active" ] && svc_icon="🔴"
+    # "absent" means the optional unit is not installed on this host — not a fault.
+    [ "$svc_shred" != "active" ] && [ "$svc_shred" != "absent" ] && svc_icon="🔴"
+    [ "$svc_dz"    != "active" ] && [ "$svc_dz"    != "absent" ] && svc_icon="🔴"
 
     case "$cached_dz_status" in
         ALL_UP)      dz_icon="🟢" ;;
@@ -1228,8 +1296,8 @@ while true; do
     [ -n "$me_present" ] && [ "$vote_lag" -gt "$VOTE_LAG_CRIT" ] && issues=$((issues+1))
     [ "$cluster_staked" -lt "$MIN_PEERS_STAKED" ] && issues=$((issues+1))
     [ "$svc_sol"   != "active" ] && issues=$((issues+1))
-    [ "$svc_shred" != "active" ] && issues=$((issues+1))
-    [ "$svc_dz"    != "active" ] && issues=$((issues+1))
+    [ "$svc_shred" != "active" ] && [ "$svc_shred" != "absent" ] && issues=$((issues+1))
+    [ "$svc_dz"    != "active" ] && [ "$svc_dz"    != "absent" ] && issues=$((issues+1))
     [ "$cached_dz_status" = "DEGRADED" ] && issues=$((issues+1))
     [ "$bam_present" = 1 ] && [ "$bam_unhealthy" -gt 0 ] && issues=$((issues+1))
 

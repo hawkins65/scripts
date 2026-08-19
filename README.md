@@ -68,9 +68,47 @@ epoch is normal, not a fault.
 
 `validator-monitor.sh` reads the validator's own JSON-RPC endpoint, its log, and
 local sources (filesystem, the `doublezerod` socket, systemd). It shells out to
-no `solana` CLI and depends on no public RPC. It derives the log path from the
-validator's `--log` flag rather than assuming one, which matters on hosts where
-`/home/sol/logs` is a symlink into the ledger mount.
+no `solana` CLI and depends on no public RPC.
+
+**Log source.** Not everyone runs with `--log`; plenty of operators let the
+validator write to stdout and read it back with `journalctl`. Both work:
+
+```bash
+LOG_SOURCE=auto     # default — see below
+LOG_SOURCE=file     LOG_FILE=/mnt/ledger/logs/validator.log
+LOG_SOURCE=journal  LOG_UNIT=sol.service
+```
+
+On `auto` it derives the path from the `--log` flag in your validator start
+script and uses that file if it is readable; otherwise it falls back to
+journald. Deriving beats assuming — a host logging to
+`/mnt/ledger/logs/validator.log` may match the historical `/home/sol/logs`
+default only because the latter is a symlink to it, and a rebuild silently
+breaks that. When a `--log` file does exist it is preferred over journald,
+since journald may be rate-limiting and dropping the very datapoint lines this
+monitor counts.
+
+**Everything else is an environment variable**, with defaults in the config
+block at the top:
+
+| Variable | Default | |
+|---|---|---|
+| `RPC_URL` | `http://127.0.0.1:8899` | the validator's own RPC |
+| `VOTE_PUBKEY` | from `rpc.conf` | required |
+| `SERVICE_NAME` | `sol` | validator unit |
+| `LOG_SOURCE` / `LOG_FILE` / `LOG_UNIT` | `auto` | see above |
+| `VALIDATOR_START_SCRIPT` | `~/validator.sh` | scanned for `--log` |
+| `LEDGER_DIR` | `/mnt/ledger` | |
+| `SNAPSHOT_DIR` | `/mnt/accounts1/snapshots` | |
+| `SHREDSTREAM_UNIT` | `jito-shredstream.service` | |
+| `DOUBLEZERO_UNIT` | `doublezerod.service` | |
+| `DZ_SOCKET` | `/run/doublezerod/doublezerod.sock` | |
+
+The Jito and DoubleZero units are optional. If they are not installed they
+report `absent` and are not counted as faults, so a plain Agave node does not
+sit permanently red. (`systemctl is-active` reports a nonexistent unit as
+`inactive`, identical to one that is installed and stopped — the script checks
+for existence separately to tell the two apart.)
 
 Its warning thresholds — especially `VOTE_RX_WARN` — were calibrated on specific
 hardware and stake. The comments explain the method; recalibrate on your own
