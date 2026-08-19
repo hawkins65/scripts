@@ -18,8 +18,30 @@ source "$HOME/.config/validator/secrets.conf" 2>/dev/null
 DISCORD_WEBHOOK="${DISCORD_WEBHOOK:-$DISCORD_WEBHOOK_TUNNEL}"
 DISCORD_USERNAME="DoubleZero Guard"
 
-# shellcheck source=/home/sol/999_discord_embed.sh
-source "$HOME/999_discord_embed.sh"
+# Discord notifications are OPTIONAL. If you have a helper that provides
+# send_discord_embed, point DISCORD_EMBED_LIB at it; otherwise alerts fall back
+# to a plain webhook POST, and if no webhook is set they go to the log only.
+DISCORD_EMBED_LIB="${DISCORD_EMBED_LIB:-$HOME/discord_embed.sh}"
+# shellcheck source=/dev/null
+[ -r "$DISCORD_EMBED_LIB" ] && source "$DISCORD_EMBED_LIB"
+
+if ! declare -F send_discord_embed >/dev/null 2>&1; then
+    # Minimal stand-in: same first four positional args, extra key=value args
+    # ignored. No webhook configured means log-only, which is a valid setup.
+    send_discord_embed() {
+        local webhook="$1" severity="$2" title="$3" description="$4"
+        [ -n "$webhook" ] || return 0
+        local color=3447003
+        case "$severity" in
+            critical) color=15158332 ;;
+            error)    color=15105570 ;;
+            warning)  color=16776960 ;;
+        esac
+        curl -s -m 10 -H 'Content-Type: application/json' -X POST "$webhook" \
+            -d "$(jq -nc --arg t "$title" --arg d "$description" --argjson c "$color" \
+                  '{embeds:[{title:$t,description:$d,color:$c}]}')" >/dev/null 2>&1 || true
+    }
+fi
 
 mkdir -p "$LOG_DIR"
 

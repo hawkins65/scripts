@@ -148,7 +148,7 @@ SLOW_REFRESH="${SLOW_REFRESH:-30}"          # slower cycle for doublezerod tunne
 # Cached "rare-event" lookups (placeholder; ported helper kept for future use)
 FULL_SCAN_INTERVAL=120
 
-# ---- Health thresholds (mainnet-tuned per port-guide) ----
+# ---- Health thresholds (mainnet-tuned) ----
 PROC_LAG_WARN=2          # processed-vs-cluster (uses voted max from getVoteAccounts)
 PROC_LAG_CRIT=8
 FINAL_LAG_WARN=64        # processed - finalized
@@ -161,7 +161,7 @@ MIN_PEERS_STAKED=600     # cluster_nodes_retransmit num_nodes_staked (observed ~
 # Vote reception: cluster_info_vote_listener received_count, averaged over the
 # log tail. This is a LEADING indicator of under-packing other validators' votes
 # — it drops the moment a host comes back degraded, hours before that host next
-# has leader slots to under-pack, and nothing else we run detects it (the node is
+# has leader slots to under-pack, and ordinary liveness checks miss it (the node is
 # voting fine, so every liveness check stays green).
 # Calibration method: read the counter on a known-healthy host and a known-
 # degraded one over the SAME minutes on the same cluster, then split the two.
@@ -185,13 +185,13 @@ BUILD_SCAN_TIMEOUT_S="${BUILD_SCAN_TIMEOUT_S:-5}"  # cap the leader-build backsc
 #
 # Follows the network slot target, which is no longer a constant: Solana is
 # stepping it down by feature gate (350ms effective epoch 1020, then 300/250/200
-# proposed). Mirrors config/slot_time.py SLOT_TARGET_SCHEDULE in trillium_live.
-# Update when a gate goes EFFECTIVE — effective, not activation; Solana gates
-# run a full epoch behind their activation.
+# proposed). Update when a gate goes EFFECTIVE — effective, not activation;
+# Solana gates run a full epoch behind their activation.
 #
-# Unlike ha_peer.sh, this one is NOT set ahead to the next target. Nothing here
-# gates an action: it feeds a display and a degraded-mode fallback, so being
-# accurate matters more than being conservative.
+# This value is deliberately NOT set ahead to the next proposed target. Nothing
+# here gates an action: it feeds a display and a degraded-mode fallback, so
+# being accurate matters more than being conservative. A script that DOES gate
+# an action on slot timing should lean the other way.
 SLOT_DURATION_DEFAULT=0.4    # mainnet target; 0.35 from epoch 1020
 
 # ---- Delta tracking ----
