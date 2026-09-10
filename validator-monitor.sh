@@ -33,7 +33,10 @@ RPC_URL="${RPC_URL:-http://127.0.0.1:8899}"
 LEDGER_DIR="${LEDGER_DIR:-/mnt/ledger}"
 SNAPSHOT_DIR="${SNAPSHOT_DIR:-/mnt/accounts1/snapshots}"
 SERVICE_NAME="${SERVICE_NAME:-sol}"
-SHREDSTREAM_UNIT="${SHREDSTREAM_UNIT:-jito-shredstream.service}"
+# Jito is retiring shredstream region by region. Hosts that have moved to the
+# DoubleZero multicast run a shredstream-proxy `forward-only` unit instead;
+# that is the default here. Still on Jito? SHREDSTREAM_UNIT=jito-shredstream.service
+SHREDSTREAM_UNIT="${SHREDSTREAM_UNIT:-dz-shred-forward.service}"
 DOUBLEZERO_UNIT="${DOUBLEZERO_UNIT:-doublezerod.service}"
 DZ_SOCKET="${DZ_SOCKET:-/run/doublezerod/doublezerod.sock}"
 VALIDATOR_START_SCRIPT="${VALIDATOR_START_SCRIPT:-$HOME/validator.sh}"
@@ -816,6 +819,17 @@ while true; do
     svc_shred=$(_svc_state "$SHREDSTREAM_UNIT")
     svc_dz=$(_svc_state "$DOUBLEZERO_UNIT")
 
+    # --- Running validator client (JitoLabs / Agave / Firedancer) ---
+    # getVersion returns solana-core + feature-set but not the client, and the
+    # installed active_release/ can be a staged upgrade that is not yet running.
+    # The MainPID's own binary is the only thing that is true right now.
+    val_pid=$(systemctl show -p MainPID --value "$SERVICE_NAME" 2>/dev/null)
+    if [ "${val_pid:-0}" -gt 0 ] && [ "$val_pid" != "${cached_val_pid:-}" ]; then
+        cached_val_pid=$val_pid
+        val_client=$(/proc/"$val_pid"/exe --version 2>/dev/null | sed -n 's/.*client:\([^)]*\)).*/\1/p')
+    fi
+    [ "${val_pid:-0}" -gt 0 ] || val_client=""
+
     # --- Leader schedule (refetch only on epoch boundary) ---
     # Look up under the STAKED identity — the local (possibly hot-spare) identity
     # may have zero leader slots this epoch.
@@ -1100,7 +1114,7 @@ while true; do
     fi
     echo "🆔 Identity:   ${IDENTITY_PUBKEY:-?}${identity_role}"
     echo "🗳️  Vote:       ${VOTE_PUBKEY}"
-    echo "📦 Version:    agave-validator $sol_version | feature-set $feature_set | health $health_icon $health"
+    echo "📦 Version:    agave-validator $sol_version${val_client:+ (client:$val_client)} | feature-set $feature_set | health $health_icon $health"
     echo "📅 Epoch:      $epoch | slot $slot_index of $(fmt $slots_in_epoch) (${epoch_pct}%)"
     echo "⏱️  Uptime:     $uptime_display"
     echo "🐧 OS:         $os_pretty | kernel $kernel_version"
@@ -1251,9 +1265,9 @@ while true; do
     echo "│"
     echo "├─ $(sec_tag svc s)⚙️  Services: $svc_icon"
     if ! is_collapsed svc; then
-    printf "│   ├─ %s:           %s\n" "$SERVICE_NAME.service" "$svc_sol"
-    printf "│   ├─ shredstream:      %s\n" "$svc_shred"
-    printf "│   └─ doublezerod:      %s\n" "$svc_dz"
+    printf "│   ├─ %-23s%s\n" "$SERVICE_NAME.service:" "$svc_sol"
+    printf "│   ├─ %-23s%s\n" "${SHREDSTREAM_UNIT%.service}:" "$svc_shred"
+    printf "│   └─ %-23s%s\n" "${DOUBLEZERO_UNIT%.service}:" "$svc_dz"
     fi
     echo "│"
     echo "└─ $(sec_tag sys y)🖥️  System Health:"

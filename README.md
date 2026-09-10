@@ -100,7 +100,7 @@ block at the top:
 | `VALIDATOR_START_SCRIPT` | `~/validator.sh` | scanned for `--log` |
 | `LEDGER_DIR` | `/mnt/ledger` | |
 | `SNAPSHOT_DIR` | `/mnt/accounts1/snapshots` | |
-| `SHREDSTREAM_UNIT` | `jito-shredstream.service` | |
+| `SHREDSTREAM_UNIT` | `dz-shred-forward.service` | set to `jito-shredstream.service` if you still take shreds from Jito rather than the DoubleZero multicast |
 | `DOUBLEZERO_UNIT` | `doublezerod.service` | |
 | `DZ_SOCKET` | `/run/doublezerod/doublezerod.sock` | |
 
