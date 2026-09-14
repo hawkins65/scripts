@@ -27,6 +27,11 @@ RPC_URL="$MAINNET_RPC_URL"
 performance_samples=$(curl -s $RPC_URL -X POST -H "Content-Type: application/json" -d '{"jsonrpc":"2.0","id":1,"method":"getRecentPerformanceSamples","params":[1]}')
 num_slots=$(echo "$performance_samples" | jq -r '.result[0].numSlots')
 sample_period_secs=$(echo "$performance_samples" | jq -r '.result[0].samplePeriodSecs')
+# numSlots=0 in the newest sample means no slots were produced (cluster halted, e.g. a restart)
+if ! [[ $num_slots =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: RPC reports numSlots=$num_slots in the latest performance sample (slot $(echo "$performance_samples" | jq -r ".result[0].slot")) - cluster halted or RPC error" >&2
+    exit 1
+fi
 SLOT_DURATION=$(echo "scale=6; $sample_period_secs / $num_slots" | bc -l)
 
 # Define ANSI escape codes for formatting
