@@ -137,8 +137,8 @@ JUPITER_PRICE_URL="https://lite-api.jup.ag/price/v3"
 # Severity colors (decimal for Discord embeds)
 COLOR_OK=5361510        # 0x51CF66 green
 COLOR_INFO=3382000      # 0x339AF0 blue
-COLOR_WARNING=16002055  # 0xF4AC07 gold
-COLOR_ERROR=16738155    # 0xFF6B6B red
+COLOR_WARNING=16034823  # 0xF4AC07 gold
+COLOR_ERROR=16739179    # 0xFF6B6B red
 
 # ---------------------------------------------------------------------------
 # Logging (tee everything to a log file)
