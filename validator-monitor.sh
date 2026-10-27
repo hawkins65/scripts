@@ -36,7 +36,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Bump on every deploy (date.N); shown in the top line so a host running a stale copy is obvious.
-SCRIPT_VERSION="2026.10.26.5"
+SCRIPT_VERSION="2026.10.27.1"
 
 # ---- Secrets ----
 # Optional secrets file (external RPC endpoints with embedded tokens; used on the
@@ -425,8 +425,6 @@ if [ -z "${VOTE_PUBKEY:-}" ] && [ -f "$HOME/.config/validator/rpc.conf" ]; then
     . "$HOME/.config/validator/rpc.conf" 2>/dev/null || true
     VOTE_PUBKEY="${VOTE_PUBKEY:-${VOTE_ACCOUNT:-}}"
 fi
-# alpenglow host default (its rpc.conf may not carry VOTE_ACCOUNT).
-[ -z "${VOTE_PUBKEY:-}" ] && [ "$HOST_PROFILE" = alpenglow ] && VOTE_PUBKEY="tRi1iJqMw33WYJbnRHdRZMcqYya2d7KFWbmcWLMfXbL"
 if [ -z "${VOTE_PUBKEY:-}" ]; then
     echo "ERROR: VOTE_PUBKEY env var is required (your vote account pubkey)." >&2
     echo "       Or set VOTE_ACCOUNT in ~/.config/validator/rpc.conf." >&2
