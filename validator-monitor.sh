@@ -1,9 +1,11 @@
 #!/bin/bash
 
-# Agave Validator Node Monitor (mainnet-beta — Jito-Agave + BAM + DoubleZero)
-# Reads from the agave-validator JSON-RPC endpoint, the validator log, and a
-# few local sources (filesystem, doublezerod unix socket, systemd). No
-# `solana` CLI subprocess calls, no public-RPC dependency.
+# Validator Node Monitor — ONE file for every Trillium validator host
+# (new-amsterdam, ogden: mainnet · testnet-ogden: testnet · alpenglow: its own chain).
+# Network: genesis hash (mainnet/testnet); the alpenglow host is keyed on its
+# alpenglow.service unit. Client: Jito-Agave or FireBAM, detected each cycle.
+# Reads the local JSON-RPC, the validator log (FireBAM: firebam-log-view.py and
+# its :7999 metrics), the doublezerod socket and systemd. No `solana` CLI calls.
 #
 # Usage:
 #   VOTE_PUBKEY=<vote-pubkey> ~/validator-monitor.sh        # live monitor
@@ -12,6 +14,10 @@
 #
 # VOTE_PUBKEY is required; if unset, falls back to VOTE_ACCOUNT in
 # ~/.config/validator/rpc.conf so this host's monitor can be started with no env.
+# The stack (Agave or FireBAM) is detected each cycle; VALIDATOR_CLIENT=agave|firebam forces it.
+# CLUSTER_RPC_URL (rpc.conf MAINNET_/TESTNET_RPC_URL, or ~/secrets.env on
+# alpenglow) adds an "outside view": an independent tip and the cluster's
+# opinion of our vote account. Its endpoint is never printed.
 #
 # Press Ctrl+C to exit live mode.
 
@@ -22,17 +28,102 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --once|--run-once) RUN_ONCE=true; shift ;;
         --help|-h)
-            sed -n '3,15p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
 
+# Bump on every deploy (date.N); shown in the top line so a host running a stale copy is obvious.
+SCRIPT_VERSION="2026.10.26.5"
+
+# ---- Secrets ----
+# Optional secrets file (external RPC endpoints with embedded tokens; used on the
+# alpenglow host). Everything set here becomes a default for the config below,
+# so credentials stay out of argv, the process table and this script.
+SECRETS_ENV="${SECRETS_ENV:-$HOME/secrets.env}"
+if [ -r "$SECRETS_ENV" ]; then
+    set -a
+    # shellcheck disable=SC1090
+    . "$SECRETS_ENV"
+    set +a
+fi
+
+# ---- Host profile ----
+# The alpenglow box runs a separate chain whose genesis hash changes on every
+# regenesis, so it cannot be keyed by genesis like mainnet/testnet: key it on
+# its unit. Everything else is "standard" (the sol-user mainnet/testnet hosts).
+HOST_PROFILE=standard
+if systemctl list-unit-files alpenglow.service --no-legend 2>/dev/null | grep -q .; then
+    HOST_PROFILE=alpenglow
+fi
+
 RPC_URL="${RPC_URL:-http://127.0.0.1:8899}"
+# CLUSTER_RPC_URL is an independent full RPC (a secret: env, rpc.conf or
+# ~/secrets.env — never written into this file). Two uses:
+#   1. "Outside view": an independent tip + the cluster's opinion of our vote
+#      account (2 getSlot per cycle + one FILTERED getVoteAccounts per SLOW_REFRESH).
+#   2. FireBAM only: getVoteAccounts / getRecentPerformanceSamples, which its
+#      local RPC answers with HTTP 501. Agave keeps those on RPC_URL (an
+#      unfiltered getVoteAccounts every cycle is not worth an external bill).
+# Resolved after the network is known (detect_network): mainnet -> rpc.conf
+# MAINNET_RPC_URL, testnet -> TESTNET_RPC_URL; alpenglow -> secrets.env
+# QUICKNODE_ALPENGLOW_RPC_URL / QUICKNODE_RPC_URL. Empty = no outside view.
+CLUSTER_RPC_URL="${CLUSTER_RPC_URL:-}"
+if [ -z "$CLUSTER_RPC_URL" ] && [ "$HOST_PROFILE" = alpenglow ]; then
+    CLUSTER_RPC_URL="${QUICKNODE_ALPENGLOW_RPC_URL:-${QUICKNODE_RPC_URL:-}}"
+fi
+# Screen label for the outside endpoint — never the URL (QuickNode puts the auth
+# token in the path).
+_cluster_rpc_label() {
+    [ -n "${CLUSTER_RPC_LABEL_ENV:-}" ] && { CLUSTER_RPC_LABEL="$CLUSTER_RPC_LABEL_ENV"; return; }
+    local h
+    h=$(echo "$CLUSTER_RPC_URL" | sed -E 's#^[a-z]+://([^/]+).*#\1#')
+    case "$h" in
+        *quiknode.pro|*quicknode.com) CLUSTER_RPC_LABEL="quicknode" ;;
+        "")                           CLUSTER_RPC_LABEL="outside" ;;
+        *)                            CLUSTER_RPC_LABEL="$h" ;;
+    esac
+}
+CLUSTER_RPC_LABEL_ENV="${CLUSTER_RPC_LABEL:-}"
+# OUTSIDE_VIEW=0 turns the outside-view rows and their calls off (the FireBAM
+# vote list still uses CLUSTER_RPC_URL, at most every VOTE_LIST_REFRESH).
+OUTSIDE_VIEW="${OUTSIDE_VIEW:-1}"
+_outside_on() { [ "$OUTSIDE_VIEW" = 1 ] && [ -n "$CLUSTER_RPC_URL" ] && [ "$CLUSTER_RPC_URL" != "$RPC_URL" ]; }
+_cluster_rpc_label
+
+# FireBAM's RPC rejects JSON-RPC batch arrays (-32700). Send each call alone and
+# join the replies into one array. Prints nothing when no call got a reply.
+rpc_batch() {
+    local url="$1"; shift
+    local arr="[]" reply body
+    local ok=0
+    for body in "$@"; do
+        reply=$(curl -s --connect-timeout 3 -X POST -H 'Content-Type: application/json' \
+            --data "$body" "$url" 2>/dev/null)
+        if [ -n "$reply" ] && jq -e 'type=="object" and has("id")' <<<"$reply" >/dev/null 2>&1; then
+            # Pipe the reply, not --argjson: vote-account replies exceed ARG_MAX.
+            arr=$(printf '%s\n%s' "$arr" "$reply" | jq -cs '.[0] + [.[1]]')
+            ok=1
+        fi
+    done
+    [ "$ok" = 1 ] && echo "$arr"
+}
+
+if [ "$HOST_PROFILE" = alpenglow ]; then
+    LEDGER_DIR="${LEDGER_DIR:-$HOME/ledger}"
+    SNAPSHOT_DIR="${SNAPSHOT_DIR:-$HOME/ledger}"
+    SERVICE_NAME="${SERVICE_NAME:-alpenglow}"
+    NETWORK="${NETWORK:-alpenglow}"
+fi
 LEDGER_DIR="${LEDGER_DIR:-/mnt/ledger}"
 SNAPSHOT_DIR="${SNAPSHOT_DIR:-/mnt/accounts1/snapshots}"
-SERVICE_NAME="${SERVICE_NAME:-sol}"
+# Main validator unit. Empty = per stack (agave: sol, firebam: firebam); see detect_client.
+_SERVICE_NAME_ENV="${SERVICE_NAME:-}"
+SERVICE_NAME=""
+# mainnet | testnet | alpenglow. Empty = probe getGenesisHash (see detect_network).
+NETWORK="${NETWORK:-}"
 # Jito is retiring shredstream region by region. Hosts that have moved to the
 # DoubleZero multicast run a shredstream-proxy `forward-only` unit instead;
 # that is the default here. Still on Jito? SHREDSTREAM_UNIT=jito-shredstream.service
@@ -40,7 +131,7 @@ SHREDSTREAM_UNIT="${SHREDSTREAM_UNIT:-dz-shred-forward.service}"
 DOUBLEZERO_UNIT="${DOUBLEZERO_UNIT:-doublezerod.service}"
 DZ_SOCKET="${DZ_SOCKET:-/run/doublezerod/doublezerod.sock}"
 VALIDATOR_START_SCRIPT="${VALIDATOR_START_SCRIPT:-$HOME/validator.sh}"
-LOG_FILE_FALLBACK="${LOG_FILE_FALLBACK:-/home/sol/logs/validator.log}"
+LOG_FILE_FALLBACK="${LOG_FILE_FALLBACK:-$HOME/logs/validator.log}"
 
 # ---- Log source: a file, or journald ----
 #
@@ -67,21 +158,66 @@ _derive_log_file() {
     printf '%s' "${p:-$LOG_FILE_FALLBACK}"
 }
 LOG_FILE="${LOG_FILE:-$(_derive_log_file)}"
-LOG_UNIT="${LOG_UNIT:-$SERVICE_NAME}"
-LOG_SOURCE="${LOG_SOURCE:-auto}"
-if [ "$LOG_SOURCE" = auto ]; then
-    if [ -r "$LOG_FILE" ]; then
-        LOG_SOURCE=file
-    elif command -v journalctl >/dev/null 2>&1 \
-         && [ -n "$(journalctl -u "$LOG_UNIT" -n 1 --no-pager -o cat 2>/dev/null)" ]; then
-        # Test for OUTPUT, not exit status: journalctl exits 0 for a unit that
-        # has never logged anything, so a status check would happily select
-        # journald for a unit name that does not exist.
-        LOG_SOURCE=journal
-    else
-        LOG_SOURCE=file   # nothing readable either way; downstream shows empty
+_LOG_UNIT_ENV="${LOG_UNIT:-}"
+_LOG_SOURCE_ENV="${LOG_SOURCE:-auto}"
+# FireBAM writes firebam.log in its own format. While firedancer runs (CLIENT=firebam),
+# this helper prints the Agave-style lines the monitor reads (see firebam-log-view.py).
+# Fields it does not print are shown as n/a, not 0.
+FIREBAM_LOG_VIEW="${FIREBAM_LOG_VIEW:-$HOME/bam-leader-activity/firebam-log-view.py}"
+
+# ---- Validator stack: agave | firebam ----
+#
+# One script serves both. VALIDATOR_CLIENT=agave|firebam overrides detection.
+# Otherwise: a running firedancer process = firebam, a running agave-validator
+# = agave. With neither running (validator down or restarting) keep the last
+# answer, and on the first pass fall back to which unit is installed, so a
+# stopped FireBAM host reports firebam.service down, not a phantom sol.service.
+# The client picks the main unit, the log source and the Agave-only rows.
+CLIENT=""
+detect_client() {
+    local prev="$CLIENT"
+    case "${VALIDATOR_CLIENT:-}" in
+        agave|firebam) CLIENT="$VALIDATOR_CLIENT" ;;
+        "")
+            if pgrep -x firedancer >/dev/null 2>&1; then
+                CLIENT=firebam
+            elif pgrep -x agave-validator >/dev/null 2>&1; then
+                CLIENT=agave
+            elif [ -z "$CLIENT" ]; then
+                if [ "$(_svc_state "${_SERVICE_NAME_ENV:-$( [ "$HOST_PROFILE" = alpenglow ] && echo alpenglow || echo sol )}")" = absent ] \
+                   && [ "$(_svc_state firebam.service)" != absent ]; then
+                    CLIENT=firebam
+                else
+                    CLIENT=agave
+                fi
+            fi
+            ;;
+        *) echo "ERROR: VALIDATOR_CLIENT must be agave or firebam (got '$VALIDATOR_CLIENT')." >&2; exit 1 ;;
+    esac
+    if [ "$CLIENT" = firebam ]; then SERVICE_NAME="${_SERVICE_NAME_ENV:-firebam}"
+    else SERVICE_NAME="${_SERVICE_NAME_ENV:-$( [ "$HOST_PROFILE" = alpenglow ] && echo alpenglow || echo sol )}"; fi
+    # Re-pick the log source when the stack changes (it depends on the unit name).
+    [ "$CLIENT" != "$prev" ] && _select_log_source
+}
+
+# Agave log source. LOG_SOURCE=auto picks file or journal; FireBAM ignores it.
+_select_log_source() {
+    LOG_UNIT="${_LOG_UNIT_ENV:-$SERVICE_NAME}"
+    LOG_SOURCE="$_LOG_SOURCE_ENV"
+    if [ "$LOG_SOURCE" = auto ]; then
+        if [ -r "$LOG_FILE" ]; then
+            LOG_SOURCE=file
+        elif command -v journalctl >/dev/null 2>&1 \
+             && [ -n "$(journalctl -u "$LOG_UNIT" -n 1 --no-pager -o cat 2>/dev/null)" ]; then
+            # Test for OUTPUT, not exit status: journalctl exits 0 for a unit that
+            # has never logged anything, so a status check would happily select
+            # journald for a unit name that does not exist.
+            LOG_SOURCE=journal
+        else
+            LOG_SOURCE=file   # nothing readable either way; downstream shows empty
+        fi
     fi
-fi
+}
 
 # Service state: active | inactive | failed | absent.
 #
@@ -99,9 +235,169 @@ _svc_state() {
     systemctl is-active "$1" 2>/dev/null
 }
 
+# FireBAM serves Prometheus metrics on 127.0.0.1:7999. One read per cycle fills
+# the fb_* variables. Tile CPU = share of time in processing_* + backpressure_*
+# regimes (tile_regime_duration_nanos_total), as a delta against the previous
+# cycle; on the first cycle (and with --once) it is the average since boot.
+FIREBAM_METRICS_URL="${FIREBAM_METRICS_URL:-http://127.0.0.1:7999/metrics}"
+declare -A FB_PREV_BUSY FB_PREV_BP FB_PREV_TOT
+# Per tile: "kind:id busy_ns bp_ns total_ns" from a metrics body.
+_fb_tile_totals() {
+    echo "$1" | awk '/^tile_regime_duration_nanos_total\{/ {
+            match($0, /kind="[^"]*"/); k=substr($0, RSTART+6, RLENGTH-7)
+            match($0, /kind_id="[^"]*"/); i=substr($0, RSTART+9, RLENGTH-10)
+            match($0, /tile_regime="[^"]*"/); r=substr($0, RSTART+13, RLENGTH-14)
+            key=k":"i; tot[key]+=$NF
+            if (r ~ /^(processing|backpressure)_/) busy[key]+=$NF
+            if (r ~ /^backpressure_/) bp[key]+=$NF }
+        END { for (t in tot) printf "%s %.0f %.0f %.0f\n", t, busy[t], bp[t], tot[t] }'
+}
+# NIC counters summed over FireBAM's mlx5 queues: "rx_bytes tx_bytes rx_pkts tx_pkts rx_drops".
+# FireBAM moves traffic through XDP, so the kernel's net-stats datapoint is gone.
+_fb_nic_sums() {
+    # mlx5_* = FireBAM's Mellanox driver (new-amsterdam); net_* = its generic
+    # XDP net tile (testnet-ogden's igb). A host has one or the other.
+    echo "$1" | awk '
+        /^(mlx5|net)_pkt_rx_bytes_total[{ ]/                {rb+=$NF}
+        /^mlx5_pkt_tx_completed_bytes_total[{ ]/            {tb+=$NF}
+        /^net_pkt_tx_submitted_bytes_total[{ ]/             {tb+=$NF}
+        /^(mlx5|net)_pkt_rx_total[{ ]/                      {rp+=$NF}
+        /^(mlx5|net)_pkt_tx_completed_total[{ ]/            {tp+=$NF}
+        /^(mlx5|net)_pkt_rx_dropped_total[{ ]/              {rd+=$NF}
+        END {printf "%.0f %.0f %.0f %.0f %.0f\n", rb, tb, rp, tp, rd}'
+}
+# Shred tile: "accepted completed rejected parse_failed equivocated duplicate repair_rx".
+_fb_shred_sums() {
+    echo "$1" | awk '
+        /^shred_processed_total[{]/ {
+            match($0, /shred_process_result="[^"]*"/); r=substr($0, RSTART+22, RLENGTH-23); v[r]+=$NF }
+        /^shred_repair_rx_total[{ ]/ {rx+=$NF}
+        END {printf "%.0f %.0f %.0f %.0f %.0f %.0f %.0f\n", v["accepted"], v["completed"], v["rejected"],
+             v["parse_failed"], v["equivocated"], v["duplicate"], rx}'
+}
+# Votor: "votes_ok certs_ok slashable sig_failed banned superseded".
+_fb_votor_sums() {
+    echo "$1" | awk '
+        /^votor_vote_rx_total[{]/ && /vote_rx_result="success"/          {vo+=$NF}
+        /^votor_cert_rx_total[{]/ && /cert_rx_result="success"/          {co+=$NF}
+        /^votor_vote_rx_total[{]/ && /vote_rx_result="slashable"/        {sl+=$NF}
+        /^votor_(vote|cert)_rx_total[{]/ && /_rx_result="signature_failed"/ {sf+=$NF}
+        /^votor_(vote|cert)_rx_total[{]/ && /_rx_result="banned"/        {bn+=$NF}
+        /^votor_leader_window_superseded_total[{ ]/                       {su+=$NF}
+        END {printf "%.0f %.0f %.0f %.0f %.0f %.0f\n", vo, co, sl, sf, bn, su}'
+}
+FB_PREV_NIC=""; FB_PREV_SHRED=""; FB_PREV_VOTOR=""
+_fb_seed_tiles() {
+    FB_PREV_NIC=$(_fb_nic_sums "$1")
+    FB_PREV_VOTOR=$(_fb_votor_sums "$1")
+    FB_PREV_SHRED=$(_fb_shred_sums "$1")
+    local key busy bp tot
+    while read -r key busy bp tot; do
+        [ -n "$key" ] || continue
+        FB_PREV_BUSY[$key]=$busy; FB_PREV_BP[$key]=$bp; FB_PREV_TOT[$key]=$tot
+    done <<< "$(_fb_tile_totals "$1")"
+}
+fb_collect_metrics() {
+    local m tiles key busy bp tot pb pp pt db dp dt
+    m=$(curl -s -m 3 "$FIREBAM_METRICS_URL" 2>/dev/null)
+    [ -n "$m" ] || { fb_metrics_ok=0; return; }
+    fb_metrics_ok=1
+    # First cycle (always, with --once): no previous tile totals, and the
+    # since-boot average is dominated by the snapshot load. Seed the previous
+    # totals from this read and take the real sample 2 s later.
+    if [ "${#FB_PREV_TOT[@]}" -eq 0 ]; then
+        _fb_seed_tiles "$m"
+        sleep 2
+        m=$(curl -s -m 3 "$FIREBAM_METRICS_URL" 2>/dev/null)
+        [ -n "$m" ] || { fb_metrics_ok=0; return; }
+    fi
+    _fbv() { echo "$m" | awk -v n="$1" -v f="${2:-}" 'index($0,n"{")==1 && (f=="" || index($0,f)) {print $NF; exit}'; }
+    fb_final_cert=$(_fbv votor_highest_final_cert_slot);   fb_final_cert=${fb_final_cert%%.*}
+    fb_wait_vote=$(_fbv votor_wait_to_vote_slot);          fb_wait_vote=${fb_wait_vote%%.*}
+    fb_rank=$(_fbv votor_rank)
+    fb_vh_writes=$(_fbv votor_vote_history_file_written_total)
+    fb_pool_used=$(_fbv votor_pool_slot_used);  fb_pool_free=$(_fbv votor_pool_slot_free)
+    fb_caught_up=$(_fbv replay_is_caught_up)
+    fb_acc_used=$(_fbv accdb_account_used);     fb_acc_cap=$(_fbv accdb_account_capacity)
+    fb_bam_healthy=$(_fbv bam_healthy)
+    fb_peers_staked=$(_fbv gossip_crds_peer_count 'stake_class="staked"')
+    fb_peers_unstaked=$(_fbv gossip_crds_peer_count 'stake_class="unstaked"')
+    for v in fb_final_cert fb_wait_vote fb_vh_writes fb_pool_used fb_pool_free fb_caught_up fb_acc_used fb_acc_cap fb_bam_healthy fb_peers_staked fb_peers_unstaked; do
+        [[ "${!v}" =~ ^[0-9]+$ ]] || printf -v "$v" 0
+    done
+    # votor_rank is 2^64-1 (prints as 1.8e19) when this identity holds no stake.
+    if [[ "$fb_rank" =~ ^[0-9]+$ ]] && [ "${#fb_rank}" -lt 10 ]; then fb_role="staked (rank $fb_rank)"; else fb_role="junk (no rank)"; fi
+    # Per tile: kind:id busy_ns bp_ns total_ns
+    # NIC deltas against the previous read (the first cycle's seed is 2 s back).
+    local nic prb ptb prp ptp prd crb ctb crp ctp crd
+    nic=$(_fb_nic_sums "$m")
+    read -r crb ctb crp ctp crd <<< "$nic"
+    if [ -n "$FB_PREV_NIC" ]; then
+        read -r prb ptb prp ptp prd <<< "$FB_PREV_NIC"
+        fb_nic_rxb=$(( crb - prb )); fb_nic_txb=$(( ctb - ptb ))
+        fb_nic_rxp=$(( crp - prp )); fb_nic_txp=$(( ctp - ptp )); fb_nic_rxd=$(( crd - prd ))
+    else
+        fb_nic_rxb=0; fb_nic_txb=0; fb_nic_rxp=0; fb_nic_txp=0; fb_nic_rxd=0
+    fi
+    FB_PREV_NIC=$nic
+    # Shred deltas against the previous read.
+    local sh pa pc pr pp pe pd px ca cc cr cp ce cd cx
+    sh=$(_fb_shred_sums "$m")
+    read -r ca cc cr cp ce cd cx <<< "$sh"
+    if [ -n "$FB_PREV_SHRED" ]; then
+        read -r pa pc pr pp pe pd px <<< "$FB_PREV_SHRED"
+        fb_sh_acc=$(( ca - pa )); fb_sh_fec=$(( cc - pc )); fb_sh_rej=$(( cr - pr ))
+        fb_sh_parse=$(( cp - pp )); fb_sh_equiv=$(( ce - pe )); fb_sh_dup=$(( cd - pd )); fb_sh_repair=$(( cx - px ))
+    else
+        fb_sh_acc=0; fb_sh_fec=0; fb_sh_rej=0; fb_sh_parse=0; fb_sh_equiv=0; fb_sh_dup=0; fb_sh_repair=0
+    fi
+    FB_PREV_SHRED=$sh
+    # Votor deltas (per cycle) and totals since boot for the safety counters.
+    local vt v1 v2 v3 v4 v5 v6 w1 w2 w3 w4 w5 w6
+    vt=$(_fb_votor_sums "$m")
+    read -r w1 w2 w3 w4 w5 w6 <<< "$vt"
+    fb_vt_slashable=$w3; fb_vt_sigfail=$w4; fb_vt_banned=$w5; fb_vt_superseded=$w6
+    if [ -n "$FB_PREV_VOTOR" ]; then
+        read -r v1 v2 v3 v4 v5 v6 <<< "$FB_PREV_VOTOR"
+        fb_vt_votes=$(( w1 - v1 )); fb_vt_certs=$(( w2 - v2 ))
+    else
+        fb_vt_votes=0; fb_vt_certs=0
+    fi
+    FB_PREV_VOTOR=$vt
+    fb_vt_peers=$(_fbv votor_peer_conn_open); [[ "$fb_vt_peers" =~ ^[0-9]+$ ]] || fb_vt_peers=0
+    tiles=$(_fb_tile_totals "$m")
+    fb_tile_report=""; fb_busy_max=0; fb_busy_max_tile=""; fb_bp_max=0; fb_bp_max_tile=""; fb_tile_src="since boot"
+    local rows=""
+    while read -r key busy bp tot; do
+        [ -n "$key" ] || continue
+        pb=${FB_PREV_BUSY[$key]:-}; pp=${FB_PREV_BP[$key]:-}; pt=${FB_PREV_TOT[$key]:-}
+        if [ -n "$pt" ] && [ "$tot" -gt "$pt" ]; then
+            db=$(( busy - pb )); dp=$(( bp - pp )); dt=$(( tot - pt )); fb_tile_src="live"
+        elif [ -n "$pt" ]; then
+            # Counters frozen since the last read: the tile is not running
+            # (e.g. the snapshot tiles after boot). Not a CPU consumer.
+            FB_PREV_BUSY[$key]=$busy; FB_PREV_BP[$key]=$bp; FB_PREV_TOT[$key]=$tot
+            continue
+        else
+            db=$busy; dp=$bp; dt=$tot
+        fi
+        FB_PREV_BUSY[$key]=$busy; FB_PREV_BP[$key]=$bp; FB_PREV_TOT[$key]=$tot
+        [ "$dt" -gt 0 ] || continue
+        rows+="$(awk -v b=$db -v p=$dp -v t=$dt -v k=$key 'BEGIN{printf "%.1f %.1f %s", b*100/t, p*100/t, k}')"$'\n'
+    done <<< "$tiles"
+    if [ -n "$rows" ]; then
+        read -r fb_busy_max _ fb_busy_max_tile <<< "$(echo "$rows" | sort -k1,1 -rn | head -1)"
+        read -r _ fb_bp_max fb_bp_max_tile <<< "$(echo "$rows" | sort -k2,2 -rn | head -1)"
+        fb_tile_report=$(echo "$rows" | sort -k1,1 -rn | head -5 | awk '{printf "%s%s %s%%", (NR>1?", ":""), $3, $1}')
+    fi
+}
+
 # Last N lines, oldest first — the same order `tail` gives.
+# FireBAM: the helper's translated lines; no helper = plain tail of LOG_FILE.
 _log_tail() {
-    if [ "$LOG_SOURCE" = journal ]; then
+    if [ "$CLIENT" = firebam ] && [ -x "$FIREBAM_LOG_VIEW" ]; then
+        "$FIREBAM_LOG_VIEW" --lines "$1" 2>/dev/null
+    elif [ "$LOG_SOURCE" = journal ]; then
         journalctl -u "$LOG_UNIT" -n "$1" --no-pager -o cat 2>/dev/null
     else
         tail -n "$1" "$LOG_FILE" 2>/dev/null
@@ -111,8 +407,11 @@ _log_tail() {
 # Newest line matching a pattern, scanning backwards. $1=pattern $2=timeout secs.
 # The timeout is load-bearing in file mode: `tac` on a multi-GB log with no match
 # walks the entire file. journald gets the same guard for the same reason.
+# FireBAM has no such history: the helper keeps only the last 6 h, so no backscan.
 _log_rscan() {
-    if [ "$LOG_SOURCE" = journal ]; then
+    if [ "$CLIENT" = firebam ]; then
+        return 0
+    elif [ "$LOG_SOURCE" = journal ]; then
         timeout "$2" journalctl -u "$LOG_UNIT" -r --no-pager -o cat 2>/dev/null | grep -m1 "$1"
     else
         timeout "$2" tac "$LOG_FILE" 2>/dev/null | grep -m1 "$1"
@@ -126,6 +425,8 @@ if [ -z "${VOTE_PUBKEY:-}" ] && [ -f "$HOME/.config/validator/rpc.conf" ]; then
     . "$HOME/.config/validator/rpc.conf" 2>/dev/null || true
     VOTE_PUBKEY="${VOTE_PUBKEY:-${VOTE_ACCOUNT:-}}"
 fi
+# alpenglow host default (its rpc.conf may not carry VOTE_ACCOUNT).
+[ -z "${VOTE_PUBKEY:-}" ] && [ "$HOST_PROFILE" = alpenglow ] && VOTE_PUBKEY="tRi1iJqMw33WYJbnRHdRZMcqYya2d7KFWbmcWLMfXbL"
 if [ -z "${VOTE_PUBKEY:-}" ]; then
     echo "ERROR: VOTE_PUBKEY env var is required (your vote account pubkey)." >&2
     echo "       Or set VOTE_ACCOUNT in ~/.config/validator/rpc.conf." >&2
@@ -146,12 +447,15 @@ LEADER_TZ="${LEADER_TZ:-America/Chicago}"
 
 LOG_TAIL_LINES="${LOG_TAIL_LINES:-7500}"
 SLEEP_SECS="${SLEEP_SECS:-5}"
-SLOW_REFRESH="${SLOW_REFRESH:-30}"          # slower cycle for doublezerod tunnel query
+SLOW_REFRESH="${SLOW_REFRESH:-30}"          # slower cycle: doublezerod tunnel query, outside view
+# FireBAM only: the full vote-account list comes from the external (paid)
+# CLUSTER_RPC_URL, so it is refreshed this rarely and reused in between.
+VOTE_LIST_REFRESH="${VOTE_LIST_REFRESH:-300}"
 
 # Cached "rare-event" lookups (placeholder; ported helper kept for future use)
 FULL_SCAN_INTERVAL=120
 
-# ---- Health thresholds (mainnet-tuned) ----
+# ---- Health thresholds (mainnet-tuned; testnet overrides in detect_network) ----
 PROC_LAG_WARN=2          # processed-vs-cluster (uses voted max from getVoteAccounts)
 PROC_LAG_CRIT=8
 FINAL_LAG_WARN=64        # processed - finalized
@@ -178,24 +482,97 @@ MEM_AVAIL_WARN_PCT=20
 NET_ERR_DELTA_WARN=200
 SHRED_LATENCY_WARN=800   # ms
 BLOCK_DROP_RATE_WARN=5   # percent
-LEADER_BUILD_MS_WARN=400 # block build (leader-slot start→cleared); 400ms is the per-slot budget
-LEADER_BUILD_MS_CRIT=600 # over this we're holding the slot dangerously long
+# Block build (leader-slot start→cleared), as a fraction of the LIVE slot
+# target rather than a fixed ms pair: the budget IS one slot, and at a 300ms
+# slot a 400ms build has already blown it. Resolved per refresh into
+# LEADER_BUILD_MS_WARN/_CRIT from slot_ms_target. At the historic 400ms target
+# these still resolve to exactly 400 and 600.
+LEADER_BUILD_WARN_RATIO=1.0   # a build inside one slot is on budget
+LEADER_BUILD_CRIT_RATIO=1.5   # over this we're holding the slot dangerously long
 LEADER_GROUPS_TO_SHOW=3  # next-leader groups to render
 BUILD_SCAN_TIMEOUT_S="${BUILD_SCAN_TIMEOUT_S:-5}"  # cap the leader-build backscan (see ~line 590)
-# Fallback ONLY — the live path measures slot time from
-# getRecentPerformanceSamples (see slot_ms below) and this is used just when
-# that sample is unavailable, plus as the "target" shown beside the measurement.
+# The network slot target, which is no longer a constant: Solana is stepping it
+# down by feature gate. Used as the "target" shown beside the live measurement
+# (the live path measures slot time from getRecentPerformanceSamples, see slot_ms
+# below), as the degraded-mode fallback when that sample is unavailable, and as
+# the base for the block-build budget above. Resolved from the epoch (next block).
+# DERIVED FROM THE EPOCH, not hand-mirrored: this file sat at 0.4 for four
+# epochs after the 350ms gate because the hand-update never happened. Every
+# refresh already holds `processed` (an absolute slot), and epoch =
+# slot / 432000 (slots-per-epoch is NOT changed by a slot-time gate), so this
+# costs no extra RPC call.
 #
-# Follows the network slot target, which is no longer a constant: Solana is
-# stepping it down by feature gate (350ms effective epoch 1020, then 300/250/200
-# proposed). Update when a gate goes EFFECTIVE — effective, not activation;
-# Solana gates run a full epoch behind their activation.
-#
-# This value is deliberately NOT set ahead to the next proposed target. Nothing
-# here gates an action: it feeds a display and a degraded-mode fallback, so
-# being accurate matters more than being conservative. A script that DOES gate
-# an action on slot timing should lean the other way.
-SLOT_DURATION_DEFAULT=0.4    # mainnet target; 0.35 from epoch 1020
+# Boundaries use the EFFECTIVE epoch, not the activation epoch: Solana feature
+# gates go pending at E, activate at E+1 and are only effective at E+2. 350ms is
+# effective from epoch 1020, 300ms from epoch 1024 (SIMD-0525 step 2), 250ms from 1037,
+# 200ms from 1053. Mirrors config/slot_time.py SLOT_TARGET_SCHEDULE in trillium_live.
+SLOTS_PER_EPOCH=432000
+SLOT_MS_FALLBACK=200         # no absolute slot yet (first refresh): the newest row
+
+slot_target_ms_at() {        # $1 = any absolute slot
+    # Testnet's epoch numbers don't follow the mainnet gate schedule: flat 250ms
+    # target (config/slot_time.py); it actually runs ~195ms and ETAs use the
+    # measured rate anyway. The alpenglow chain runs its own 400ms cluster target.
+    [ "$NETWORK" = testnet ] && { echo 250; return; }
+    [ "$NETWORK" = alpenglow ] && { echo 400; return; }
+    [ -n "${1:-}" ] && [ "$1" -gt 0 ] 2>/dev/null || { echo "$SLOT_MS_FALLBACK"; return; }
+    local e=$(( $1 / SLOTS_PER_EPOCH ))
+    if   [ "$e" -ge 1053 ]; then echo 200
+    elif [ "$e" -ge 1037 ]; then echo 250
+    elif [ "$e" -ge 1024 ]; then echo 300
+    elif [ "$e" -ge 1020 ]; then echo 350
+    else echo 400
+    fi
+}
+
+# ---- Network detection ----
+# Genesis hash from the local RPC (the cluster RPC when the local one will not
+# answer). Re-probed every refresh while unknown, because the monitor is often
+# started while the validator is still booting with RPC down; until then mainnet
+# thresholds apply. Alpenglow is not keyed here on purpose: its genesis hash
+# changes on every regenesis, and it runs a separate monitor.
+detect_network() {
+    local g url
+    if [ -z "$NETWORK" ] || [ "$NETWORK" = unknown ]; then
+        for url in "$RPC_URL" ${CLUSTER_RPC_URL:+"$CLUSTER_RPC_URL"}; do
+            g=$(curl -s --connect-timeout 2 -X POST -H 'Content-Type: application/json' \
+                --data '{"jsonrpc":"2.0","id":1,"method":"getGenesisHash"}' "$url" 2>/dev/null \
+                | jq -r '.result // empty' 2>/dev/null)
+            [ -n "$g" ] && break
+        done
+        case "$g" in
+            5eykt4UsFv8P8NJdTREpY1vzqKqZKvdpKuc147dw2N9d) NETWORK=mainnet ;;
+            4uhcVJyU9pJkvQyS88uRDiswHXSCkY3zQawwpjk2NsNY) NETWORK=testnet ;;
+            *) NETWORK=unknown; return ;;
+        esac
+    fi
+    if [ "$NETWORK" = testnet ] && [ "${_net_applied:-}" != testnet ]; then
+        PROC_LAG_WARN=4; PROC_LAG_CRIT=16
+        FINAL_LAG_CRIT=256
+        ROOT_STALL_WARN=8; ROOT_STALL_CRIT=20
+        MIN_PEERS_STAKED=400     # testnet staked nodes: ~769 May 2026, ~485 Sep 2026
+        NET_ERR_DELTA_WARN=100
+        # VOTE_RX_WARN stays at the mainnet 1300: uncalibrated on testnet (read 1964
+        # on testnet-ogden 2026-09-14, so it does not false-fire).
+    fi
+    if [ "$NETWORK" = alpenglow ] && [ "${_net_applied:-}" != alpenglow ]; then
+        # Values carried over from the alpenglow host's former fork.
+        PROC_LAG_WARN=4; PROC_LAG_CRIT=32
+        FINAL_LAG_CRIT=256
+        ROOT_STALL_WARN=8; ROOT_STALL_CRIT=20
+        MIN_PEERS_STAKED=10      # small private cluster; the fork checked getClusterNodes >= 20
+        NET_ERR_DELTA_WARN=50
+    fi
+    # Outside-view / FireBAM cluster endpoint from rpc.conf, once the network is known.
+    if [ -z "$CLUSTER_RPC_URL" ] && [ -f "$HOME/.config/validator/rpc.conf" ]; then
+        case "$NETWORK" in
+            mainnet) CLUSTER_RPC_URL=$(. "$HOME/.config/validator/rpc.conf" 2>/dev/null; echo "${MAINNET_RPC_URL:-}") ;;
+            testnet) CLUSTER_RPC_URL=$(. "$HOME/.config/validator/rpc.conf" 2>/dev/null; echo "${TESTNET_RPC_URL:-}") ;;
+        esac
+        _cluster_rpc_label
+    fi
+    _net_applied=$NETWORK
+}
 
 # ---- Delta tracking ----
 prev_processed=0
@@ -206,6 +583,11 @@ prev_vote_lag=0
 prev_blocks_on_fork=0
 prev_dropped_blocks=0
 prev_new_root_max=0
+ext_ok=0; ext_processed=0; ext_finalized=0; ext_ts=0
+ext_me_state="unknown"       # active | delinquent | missing | unknown
+ext_me_last_vote=0; ext_vote_ts=0; ext_lag=0; ext_final_lag=0; ext_rel=""
+last_ext_refresh=-999        # outside view: first cycle fetches, then every SLOW_REFRESH
+cached_vote_batch="[]"; last_vote_list_refresh=-999   # FireBAM: external full vote list cache
 prev_replay_slot=0
 prev_log_warn_count=0
 prev_log_error_count=0
@@ -317,11 +699,18 @@ arrow() {
     else echo "→"; fi
 }
 
+# Row for a field the running stack has no source for (FireBAM). Shows n/a, never 0.
+# $1 = label, $2 = "last" for the closing └─ row of a section.
+na_row() {
+    local g="├"; [ "${2:-}" = last ] && g="└"
+    printf "│   %s─ %-18s%s\n" "$g" "$1:" "n/a"
+}
+
 # ---- Collapsible sections (interactive in live mode) ----
 # Each section has a stable id and a single-key hotkey. State lives in
 # SECTION_COLLAPSED; a non-blocking key read in the main loop flips entries.
 declare -A SECTION_COLLAPSED
-SECTION_IDS=(slot consensus leader latest vote perf shred bam net dz svc sys)
+SECTION_IDS=(slot consensus leader latest vote perf shred bam fd net dz svc sys)
 # Seed initial collapsed set from COLLAPSED env (space/comma separated ids),
 # e.g. COLLAPSED="perf shred bam net" ~/validator-monitor.sh
 # Default (COLLAPSED unset): collapse everything except the Vote Account section.
@@ -370,13 +759,15 @@ handle_key() {
         0) toggle_section dz ;;
         s|S) toggle_section svc ;;
         y|Y) toggle_section sys ;;
+        f|F) toggle_section fd ;;
         a|A) set_all_collapsed 0 ;;
         z|Z) set_all_collapsed 1 ;;
         q|Q) echo -e "\n\nMonitoring stopped."; exit 0 ;;
     esac
 }
 
-service_start_epoch=$(get_service_start_epoch)
+service_start_epoch=""
+_start_epoch_unit=""
 
 # Static host info (OS + kernel) — read once, doesn't change during the run
 os_pretty=$(. /etc/os-release 2>/dev/null && echo "${PRETTY_NAME:-${NAME:-Linux} ${VERSION:-}}")
@@ -386,7 +777,7 @@ kernel_version=${kernel_version:-unknown}
 
 if [ "$RUN_ONCE" != true ]; then
     clear
-    echo "Agave Validator Monitor (mainnet) — Press Ctrl+C to stop"
+    echo "Validator Monitor — Press Ctrl+C to stop"
     echo "============================================================"
     echo ""
 fi
@@ -394,25 +785,59 @@ fi
 while true; do
     now_epoch=$(date +%s)
 
+    # ---- Stack + network, every refresh (a host can swap Agave<->FireBAM, and
+    # the monitor is often started while RPC is still down) ----
+    detect_client
+    # Bridge for the FireBAM metrics blocks ported from new-amsterdam's copy.
+    [ "$CLIENT" = firebam ] && CLIENT_LABEL=FireBAM || CLIENT_LABEL=Agave
+    detect_network
+    if [ "$SERVICE_NAME" != "$_start_epoch_unit" ]; then
+        _start_epoch_unit=$SERVICE_NAME
+        service_start_epoch=$(get_service_start_epoch)
+    fi
+
     # ---- Resolve identity every refresh (set-identity hot-swaps change it
     # live during HA failover/failback; keep last known value on an RPC blip) ----
     id_now=$(resolve_identity)
     [ -n "$id_now" ] && IDENTITY_PUBKEY="$id_now"
 
     # ---- Batched RPC ----
+    ALPENGLOW_EXTRA_RPC=()
+    [ "$HOST_PROFILE" = alpenglow ] && ALPENGLOW_EXTRA_RPC=(
+        '{"jsonrpc":"2.0","id":8,"method":"getMaxRetransmitSlot"}'
+        '{"jsonrpc":"2.0","id":9,"method":"getMaxShredInsertSlot"}')
     # getClusterNodes / getMaxRetransmitSlot / getMaxShredInsertSlot are gated by
     # --private-rpc on this host (return -32601 method-not-found), so they're omitted.
-    batch=$(curl -s --connect-timeout 3 -X POST -H 'Content-Type: application/json' \
-        --data '[
-          {"jsonrpc":"2.0","id":1,"method":"getSlot","params":[{"commitment":"processed"}]},
-          {"jsonrpc":"2.0","id":2,"method":"getSlot","params":[{"commitment":"confirmed"}]},
-          {"jsonrpc":"2.0","id":3,"method":"getSlot","params":[{"commitment":"finalized"}]},
-          {"jsonrpc":"2.0","id":4,"method":"getEpochInfo"},
-          {"jsonrpc":"2.0","id":5,"method":"getVersion"},
-          {"jsonrpc":"2.0","id":6,"method":"getHealth"},
-          {"jsonrpc":"2.0","id":10,"method":"getVoteAccounts"},
-          {"jsonrpc":"2.0","id":11,"method":"getRecentPerformanceSamples","params":[3]}
-        ]' "$RPC_URL" 2>/dev/null)
+    # Local calls: slots, epoch, version, health (from RPC_URL).
+    batch=$(rpc_batch "$RPC_URL" \
+        '{"jsonrpc":"2.0","id":1,"method":"getSlot","params":[{"commitment":"processed"}]}' \
+        '{"jsonrpc":"2.0","id":2,"method":"getSlot","params":[{"commitment":"confirmed"}]}' \
+        '{"jsonrpc":"2.0","id":3,"method":"getSlot","params":[{"commitment":"finalized"}]}' \
+        '{"jsonrpc":"2.0","id":4,"method":"getEpochInfo"}' \
+        '{"jsonrpc":"2.0","id":5,"method":"getVersion"}' \
+        '{"jsonrpc":"2.0","id":6,"method":"getHealth"}' \
+        "${ALPENGLOW_EXTRA_RPC[@]}")
+    # Cluster calls: vote accounts and performance samples.
+    if [ "$CLIENT" = firebam ]; then
+        # FireBAM's RPC answers both with HTTP 501. The only other source is the
+        # external (paid) CLUSTER_RPC_URL, so the FULL vote-account list is
+        # fetched at most every VOTE_LIST_REFRESH seconds and reused in between
+        # (user rule 2026-10-26: never the full list every cycle). Performance
+        # samples are not fetched externally at all: TPS/slot time fall back to
+        # the local getEpochInfo counters.
+        if [ -n "$CLUSTER_RPC_URL" ] && [ $((now_epoch - last_vote_list_refresh)) -ge "$VOTE_LIST_REFRESH" ]; then
+            _vl=$(rpc_batch "$CLUSTER_RPC_URL" '{"jsonrpc":"2.0","id":10,"method":"getVoteAccounts"}')
+            if [ -n "$_vl" ]; then cached_vote_batch=$_vl; last_vote_list_refresh=$now_epoch; fi
+        fi
+        cluster_batch=$cached_vote_batch
+    else
+        cluster_batch=$(rpc_batch "$RPC_URL" \
+            '{"jsonrpc":"2.0","id":10,"method":"getVoteAccounts"}' \
+            '{"jsonrpc":"2.0","id":11,"method":"getRecentPerformanceSamples","params":[3]}')
+    fi
+    if [ -n "$batch" ]; then
+        batch=$(printf '%s\n%s' "$batch" "${cluster_batch:-[]}" | jq -cs '.[0] + .[1]' 2>/dev/null)
+    fi
 
     if [ -z "$batch" ]; then
         echo "$(date '+%H:%M:%S') Cannot reach RPC at $RPC_URL"
@@ -421,18 +846,60 @@ while true; do
         continue
     fi
 
+    # ---- Outside view (independent endpoint) ----
+    # Our own "cluster tip" is derived from the votes our node has seen; if it is
+    # partitioned or lagging, that number lags with it. An external endpoint is
+    # the only way to see the real tip and the cluster's opinion of our vote account.
+    # Throttled to SLOW_REFRESH (external endpoints are paid): the tip and our
+    # vote state refresh every 30 s by default, not every cycle.
+    if _outside_on \
+       && [ $((now_epoch - last_ext_refresh)) -ge "$SLOW_REFRESH" ]; then
+        last_ext_refresh=$now_epoch
+        ext_batch=$(rpc_batch "$CLUSTER_RPC_URL" \
+            '{"jsonrpc":"2.0","id":1,"method":"getSlot","params":[{"commitment":"processed"}]}' \
+            '{"jsonrpc":"2.0","id":2,"method":"getSlot","params":[{"commitment":"finalized"}]}')
+        ext_p=$(echo "$ext_batch" | jq -r '[.[] | select(.id==1) | .result // empty] | .[0] // empty' 2>/dev/null)
+        ext_f=$(echo "$ext_batch" | jq -r '[.[] | select(.id==2) | .result // empty] | .[0] // empty' 2>/dev/null)
+        if [[ "$ext_p" =~ ^[0-9]+$ ]]; then
+            ext_ok=1; ext_processed=$ext_p; ext_ts=$now_epoch
+            [[ "$ext_f" =~ ^[0-9]+$ ]] && ext_finalized=$ext_f
+        else
+            ext_ok=0
+        fi
+        # The votePubkey filter keeps the response to one entry, not the whole set.
+        if true; then
+            ext_va=$(curl -s --connect-timeout 4 --max-time 12 -X POST -H 'Content-Type: application/json' \
+                --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getVoteAccounts\",\"params\":[{\"votePubkey\":\"$VOTE_PUBKEY\"}]}" \
+                "$CLUSTER_RPC_URL" 2>/dev/null)
+            if echo "$ext_va" | jq -e '.result' >/dev/null 2>&1; then
+                ext_me_state=$(echo "$ext_va" | jq -r '
+                    if ((.result.delinquent // []) | length) > 0 then "delinquent"
+                    elif ((.result.current // []) | length) > 0 then "active"
+                    else "missing" end')
+                ext_me_last_vote=$(echo "$ext_va" | jq -r '
+                    [ (.result.current // [])[], (.result.delinquent // [])[] ]
+                    | .[0].lastVote // 0')
+                ext_vote_ts=$now_epoch
+            elif [ "$ext_vote_ts" = 0 ]; then
+                ext_me_state="unknown"
+            fi
+        fi
+    fi
+
     # ---- Parse RPC ----
     rpc_json=$(echo "$batch" | jq -c '
         . as $a |
         {
-          processed:   ($a[] | select(.id==1) | .result // 0),
-          confirmed:   ($a[] | select(.id==2) | .result // 0),
-          finalized:   ($a[] | select(.id==3) | .result // 0),
-          epoch_info:  ($a[] | select(.id==4) | .result // {}),
-          version:     ($a[] | select(.id==5) | .result // {}),
-          health:      ($a[] | select(.id==6) | (.result // .error.message // "unknown")),
-          vote:        ($a[] | select(.id==10)| .result // {}),
-          perf:        ($a[] | select(.id==11)| .result // [])
+          processed:   ([$a[] | select(.id==1)][0].result // 0),
+          confirmed:   ([$a[] | select(.id==2)][0].result // 0),
+          finalized:   ([$a[] | select(.id==3)][0].result // 0),
+          epoch_info:  ([$a[] | select(.id==4)][0].result // {}),
+          version:     ([$a[] | select(.id==5)][0].result // {}),
+          health:      ([$a[] | select(.id==6)][0] | (.result // .error.message // "unknown")),
+          vote:        ([$a[] | select(.id==10)][0].result // {}),
+          perf:        ([$a[] | select(.id==11)][0].result // []),
+          max_retx:    ([$a[] | select(.id==8)][0].result // 0),
+          max_shred:   ([$a[] | select(.id==9)][0].result // 0)
         }
     ' 2>/dev/null)
 
@@ -447,6 +914,8 @@ while true; do
     sol_version=$(echo "$rpc_json" | jq -r '.version["solana-core"] // "?"')
     feature_set=$(echo "$rpc_json" | jq -r '.version["feature-set"] // 0')
     health=$(echo "$rpc_json" | jq -r '.health')
+    max_retx=$(echo "$rpc_json" | jq -r '.max_retx // 0');   [[ "$max_retx" =~ ^[0-9]+$ ]] || max_retx=0
+    max_shred=$(echo "$rpc_json" | jq -r '.max_shred // 0'); [[ "$max_shred" =~ ^[0-9]+$ ]] || max_shred=0
 
     # Vote-account self-view + cluster aggregates.
     me_view=$(echo "$rpc_json" | jq -c --arg vp "$VOTE_PUBKEY" '
@@ -459,6 +928,13 @@ while true; do
           total_stake:      ([($v.current // [])[].activatedStake] | add // 0),
           delinquent_stake: ([($v.delinquent // [])[].activatedStake] | add // 0),
           cluster_max_last_vote: ([($v.current // [])[].lastVote] | max // 0),
+          # How many current validators trail the max by at least as much as we
+          # do. lastVote advances in steps (under Votor ~1/3 of the cluster sits
+          # 1-8 behind at any instant), so a lag is only news when few share it.
+          peers_as_far_behind: (([($v.current // [])[].lastVote] | max // 0) as $mx |
+            if $me_cur then ($mx - $me_cur.lastVote) as $lag |
+              [($v.current // [])[] | select(($mx - .lastVote) >= $lag)] | length
+            else 0 end),
           me: ($me_cur // $me_del // null),
           me_delinquent: ($me_del != null)
         }
@@ -470,8 +946,10 @@ while true; do
         me_root_slot=$(echo "$me_view" | jq -r '.me.rootSlot // 0')
         me_stake=$(echo "$me_view" | jq -r '.me.activatedStake // 0')
         me_commission=$(echo "$me_view" | jq -r '.me.commission // 0')
-        me_credits=$(echo "$me_view" | jq -r '.me.epochCredits[-1][1] // 0')
-        me_prev_credits=$(echo "$me_view" | jq -r '.me.epochCredits[-1][2] // 0')
+        # epochCredits entries are [epoch, cumulative, cumulative-at-epoch-start];
+        # the per-epoch figure is the difference, not either field.
+        me_credits=$(echo "$me_view" | jq -r '(.me.epochCredits[-1] // [0,0,0]) | .[1] - .[2]')
+        me_prev_credits=$(echo "$me_view" | jq -r '(.me.epochCredits[-2] // [0,0,0]) | .[1] - .[2]')
     else
         me_last_vote=0; me_root_slot=0; me_stake=0; me_commission=0
         me_credits=0; me_prev_credits=0
@@ -481,7 +959,12 @@ while true; do
     delinquent_count=$(echo "$me_view" | jq -r '.delinquent_count')
     total_stake=$(echo "$me_view" | jq -r '.total_stake')
     delinquent_stake=$(echo "$me_view" | jq -r '.delinquent_stake')
+    # Non-numeric (empty/null when the vote-account call failed) reads as 0, so
+    # the "!= 0" guards below hold and awk never divides by an empty value.
+    [[ "$total_stake" =~ ^[0-9]+$ ]] || total_stake=0
+    [[ "$delinquent_stake" =~ ^[0-9]+$ ]] || delinquent_stake=0
     cluster_max_last_vote=$(echo "$me_view" | jq -r '.cluster_max_last_vote')
+    peers_as_far_behind=$(echo "$me_view" | jq -r '.peers_as_far_behind')
 
     # Vote lag — how far behind the cluster our staked vote account is voting.
     # Rising vote_lag with positive delta = "going delinquent" before the ~128-slot cliff.
@@ -545,9 +1028,12 @@ while true; do
         slot_ms=$cached_slot_ms; slot_ms_src=$cached_slot_ms_src
         tps=$cached_tps; sps=$cached_sps; nvtps="n/a"; tps_src=$cached_tps_src
     fi
-    slot_ms_target=$(awk -v d="$SLOT_DURATION_DEFAULT" 'BEGIN{printf "%.0f", d*1000}')
+    slot_ms_target=$(slot_target_ms_at "$processed")
+    LEADER_BUILD_MS_WARN=$(awk -v t="$slot_ms_target" -v r="$LEADER_BUILD_WARN_RATIO" 'BEGIN{printf "%.0f", t*r}')
+    LEADER_BUILD_MS_CRIT=$(awk -v t="$slot_ms_target" -v r="$LEADER_BUILD_CRIT_RATIO" 'BEGIN{printf "%.0f", t*r}')
 
     # ---- Log tail: grab the most recent N lines once ----
+    # Agave: the validator log (file or journald). FireBAM: firebam-log-view.py.
     log_tail=$(_log_tail "$LOG_TAIL_LINES")
 
     # Latest new root from stock-agave replay_stage:
@@ -567,6 +1053,29 @@ while true; do
     tobs_slot=$(echo "$tobs_line" | sed -n 's/.* slot=\([0-9]*\)i.*/\1/p')
     tobs_root=$(echo "$tobs_line" | sed -n 's/.* root=\([0-9]*\)i.*/\1/p')
     tobs_slot=${tobs_slot:-0}; tobs_root=${tobs_root:-0}
+
+    # Alpenglow Votor (testnet since epoch 1043). Tower datapoints stop under
+    # Votor, so these replace the tower rows; all zero on a TowerBFT cluster.
+    # Ported from the alpenglow fork. Agave log lines only; FireBAM has no source.
+    ag_finalized_count=$(echo "$log_tail" | grep -cE ': Finalized .* fast: ')
+    votor_active=false; [ "$ag_finalized_count" -gt 0 ] && votor_active=true
+    ag_finalized_fast=$(echo  "$log_tail" | grep -cE ': Finalized .* fast: true')
+    ag_notar_count=$(echo "$log_tail"     | grep -c ': Block Notarized ')
+    ag_notar_fb_count=$(echo "$log_tail"  | grep -c ': Block notar-fallback ')
+    ag_skip_vote_count=$(echo "$log_tail" | grep -c ': Voting skip ')
+    ag_timeout_crash_count=$(echo "$log_tail" | grep -c ': TimeoutCrashedLeader ')
+    ag_standstill_count=$(echo "$log_tail" | grep -c ': Standstill ')
+    cp_line=$(echo "$log_tail" | grep 'datapoint: consensus_pool ' | tail -1)
+    cp_conflict=$(echo "$cp_line"       | sed -n 's/.* conflicting_votes=\([0-9]*\)i.*/\1/p')
+    cp_incoming_votes=$(echo "$cp_line" | sed -n 's/.* incoming_votes=\([0-9]*\)i.*/\1/p')
+    cp_incoming_certs=$(echo "$cp_line" | sed -n 's/.* incoming_certs=\([0-9]*\)i.*/\1/p')
+    cp_conflict=${cp_conflict:-0}; cp_incoming_votes=${cp_incoming_votes:-0}; cp_incoming_certs=${cp_incoming_certs:-0}
+    cps_line=$(echo "$log_tail" | grep 'datapoint: consensus_pool_service ' | tail -1)
+    cps_certs_sent=$(echo "$cps_line"    | sed -n 's/.* certificates_sent=\([0-9]*\)i.*/\1/p')
+    cps_certs_dropped=$(echo "$cps_line" | sed -n 's/.* certificates_dropped=\([0-9]*\)i.*/\1/p')
+    # Logged as true/false, not 0/1 -- the alpenglow fork's numeric parse never matches.
+    cps_standstill=$(echo "$cps_line" | sed -n 's/.* in_standstill_bool=\(true\|false\).*/\1/p')
+    cps_certs_sent=${cps_certs_sent:-0}; cps_certs_dropped=${cps_certs_dropped:-0}; cps_standstill=${cps_standstill:-false}
 
     # Vote reception (cluster_info_vote_listener). Averaged across the tail,
     # never `tail -1` like its neighbours: consecutive samples swing hard
@@ -633,6 +1142,28 @@ while true; do
     mem_free_pct=${mem_free_pct:-0}; mem_avail_pct=${mem_avail_pct:-0}
     mem_used=${mem_used:-0}; mem_total=${mem_total:-0}
 
+    # ---- FireBAM: :7999 metrics + /proc (no cpu-stats/memory-stats datapoints) ----
+    fb_metrics_ok=0
+    if [ "$CLIENT_LABEL" = FireBAM ]; then
+        fb_collect_metrics
+        # System CPU/memory from /proc. The load average is NOT a health signal
+        # on FireBAM (busy-polling tiles keep it near the tile count), so
+        # cpu_icon below follows the busiest tile instead.
+        cpu_num=$(nproc 2>/dev/null || echo 0)
+        read -r load1 load5 load15 _ _ < /proc/loadavg
+        threads=$(ps -eLo lwp= 2>/dev/null | wc -l)
+        mem_total=$(awk '/^MemTotal:/{print $2*1024}' /proc/meminfo)
+        mem_avail_b=$(awk '/^MemAvailable:/{print $2*1024}' /proc/meminfo)
+        mem_free_b=$(awk '/^MemFree:/{print $2*1024}' /proc/meminfo)
+        mem_used=$(( mem_total - mem_avail_b ))
+        mem_free_pct=$(awk -v f=$mem_free_b -v t=$mem_total 'BEGIN{printf "%.2f", (t?f*100/t:0)}')
+        mem_avail_pct=$(awk -v a=$mem_avail_b -v t=$mem_total 'BEGIN{printf "%.2f", (t?a*100/t:0)}')
+        fb_huge2_total=$(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages 2>/dev/null || echo 0)
+        fb_huge2_used=$(( fb_huge2_total - $(cat /sys/kernel/mm/hugepages/hugepages-2048kB/free_hugepages 2>/dev/null || echo 0) ))
+        fb_giant_used=$(( $(cat /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages 2>/dev/null || echo 0) - $(cat /sys/kernel/mm/hugepages/hugepages-1048576kB/free_hugepages 2>/dev/null || echo 0) ))
+        fb_giant_total=$(cat /sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages 2>/dev/null || echo 0)
+    fi
+
     net_line=$(echo "$log_tail" | grep 'datapoint: net-stats-validator ' | tail -1)
     # Anchor each delta with leading space so e.g. " in_errors_delta=" does not match "in_csum_errors_delta="
     rx_bytes_delta=$(echo "$net_line" | sed -n 's/.* rx_bytes_delta=\([0-9]*\)i.*/\1/p')
@@ -646,6 +1177,10 @@ while true; do
     in_err_delta=${in_err_delta:-0};   rcv_err_delta=${rcv_err_delta:-0}
     rx_drops_delta=${rx_drops_delta:-0}
     rx_pkts_delta=${rx_pkts_delta:-0}; tx_pkts_delta=${tx_pkts_delta:-0}
+    if [ "$CLIENT_LABEL" = FireBAM ] && [ "${fb_metrics_ok:-0}" = 1 ]; then
+        rx_bytes_delta=$fb_nic_rxb; tx_bytes_delta=$fb_nic_txb
+        rx_pkts_delta=$fb_nic_rxp;  tx_pkts_delta=$fb_nic_txp; rx_drops_delta=$fb_nic_rxd
+    fi
 
     # Recent leader changes & next leader slot (from replay_stage)
     last_leader_change=$(echo "$log_tail" | grep 'LEADER CHANGE at slot:' | tail -1)
@@ -765,6 +1300,12 @@ while true; do
     cluster_dead=$(echo "$cluster_line"   | sed -n 's/.* num_nodes_dead=\([0-9]*\)i.*/\1/p')
     cluster_stale=$(echo "$cluster_line"  | sed -n 's/.* num_nodes_stale=\([0-9]*\)i.*/\1/p')
     cluster_nodes=${cluster_nodes:-0}; cluster_staked=${cluster_staked:-0}
+    # FireBAM: no gossip datapoint in its log; take the peers from :7999.
+    if [ "$CLIENT_LABEL" = FireBAM ] && [ "${fb_metrics_ok:-0}" = 1 ]; then
+        cluster_staked=$fb_peers_staked
+        cluster_nodes=$(( fb_peers_staked + fb_peers_unstaked ))
+    fi
+    cluster_dead=${cluster_dead:-0}; cluster_stale=${cluster_stale:-0}
     cluster_dead=${cluster_dead:-0}; cluster_stale=${cluster_stale:-0}
 
     # --- Accounts cache ---
@@ -823,12 +1364,23 @@ while true; do
     # getVersion returns solana-core + feature-set but not the client, and the
     # installed active_release/ can be a staged upgrade that is not yet running.
     # The MainPID's own binary is the only thing that is true right now.
+    # FireBAM: the version is the binary's own (`firedancer --version`, first
+    # word); there is no client tag, so val_client stays empty.
     val_pid=$(systemctl show -p MainPID --value "$SERVICE_NAME" 2>/dev/null)
+    # FireBAM's MainPID can be a `sudo` wrapper (testnet-ogden): ask for the real process.
+    [ "$CLIENT" = firebam ] && val_pid=$(pgrep -x firedancer 2>/dev/null | head -1)
     if [ "${val_pid:-0}" -gt 0 ] && [ "$val_pid" != "${cached_val_pid:-}" ]; then
         cached_val_pid=$val_pid
-        val_client=$(/proc/"$val_pid"/exe --version 2>/dev/null | sed -n 's/.*client:\([^)]*\)).*/\1/p')
+        # A unit with CAP_SYS_NICE (testnet-ogden) makes the kernel's ptrace check
+        # refuse /proc/PID/exe to a cap-less shell even at the same uid. sol has
+        # passwordless sudo there; -n never prompts where it does not.
+        val_exe_ver=$(/proc/"$val_pid"/exe --version 2>/dev/null \
+            || sudo -n /proc/"$val_pid"/exe --version 2>/dev/null)
+        val_client=$(echo "$val_exe_ver" | sed -n 's/.*client:\([^)]*\)).*/\1/p')
+        fb_version=$(echo "$val_exe_ver" | awk 'NR==1{print $1}')
     fi
-    [ "${val_pid:-0}" -gt 0 ] || val_client=""
+    [ "${val_pid:-0}" -gt 0 ] || { val_client=""; fb_version=""; }
+    [ "$CLIENT" = firebam ] && val_client=""
 
     # --- Leader schedule (refetch only on epoch boundary) ---
     # Look up under the STAKED identity — the local (possibly hot-spare) identity
@@ -853,7 +1405,7 @@ while true; do
     if [[ "$slot_ms" =~ ^[0-9]+$ ]] && [ "$slot_ms" -gt 0 ]; then
         slot_dur=$(awk -v m="$slot_ms" 'BEGIN{printf "%.4f", m/1000}')
     else
-        slot_dur="$SLOT_DURATION_DEFAULT"
+        slot_dur=$(awk -v m="$slot_ms_target" 'BEGIN{printf "%.4f", m/1000}')
     fi
 
     # Group consecutive future leader slots and pick the first N groups.
@@ -944,7 +1496,25 @@ while true; do
     confirmed=${confirmed%%.*}; confirmed=${confirmed:-0}
     finalized=${finalized%%.*}; finalized=${finalized:-0}
 
+    # FireBAM logs no "new fork ... root:" line. Root progress comes from the RPC
+    # finalized slot instead, so the root-stall check does not fire on a silent log.
+    [ "$CLIENT" = firebam ] && new_root_max=$finalized
+
     cluster_tip=$cluster_max_last_vote
+    # Prefer the outside RPC's processed slot: a genuinely independent observation.
+    if [ "$ext_ok" = 1 ] && [ "$ext_processed" -gt "$cluster_tip" ]; then
+        cluster_tip=$ext_processed
+    fi
+    # Lag against the outside view. ext_lag drives icons/alerts (clamped at 0);
+    # ext_rel keeps the sign, since leading the provider's node is the normal case.
+    if [ "$ext_ok" = 1 ]; then
+        ext_lag=$(( ext_processed - processed )); [ "$ext_lag" -lt 0 ] && ext_lag=0
+        ext_final_lag=$(( ext_finalized - finalized )); [ "$ext_final_lag" -lt 0 ] && ext_final_lag=0
+        if [ "$ext_lag" -gt 0 ]; then ext_rel="we trail by $(fmt $ext_lag)"
+        else ext_rel="we lead by $(fmt $(( processed - ext_processed )))"; fi
+    else
+        ext_lag=0; ext_final_lag=0; ext_rel=""
+    fi
     [ "$cluster_tip" -lt "$processed" ] && cluster_tip=$processed
 
     # ---- Lag ----
@@ -1026,9 +1596,39 @@ while true; do
         mem_icon="🟢"
     fi
 
+    # Outside view: reachability first, then how far behind the independent tip.
+    if   ! _outside_on; then ext_icon="⏸️ "
+    elif [ "$ext_ok" != 1 ];                   then ext_icon="🟡"
+    elif [ "$ext_lag" -le "$PROC_LAG_WARN" ];  then ext_icon="🟢"
+    elif [ "$ext_lag" -le "$PROC_LAG_CRIT" ];  then ext_icon="🟡"
+    else ext_icon="🔴"; fi
+    case "$ext_me_state" in
+        active)     ext_vote_icon="🟢" ;;
+        delinquent) ext_vote_icon="🔴" ;;
+        missing)    ext_vote_icon="🟠" ;;
+        *)          ext_vote_icon="⏳" ;;
+    esac
+
     [ "$cluster_staked" -ge "$MIN_PEERS_STAKED" ] && peers_icon="🟢" || peers_icon="🟡"
     [ "$in_err_delta" -le "$NET_ERR_DELTA_WARN" ] && neterr_icon="🟢" || neterr_icon="🟡"
     [ "$shred_avg" -le "$SHRED_LATENCY_WARN" ] && shred_icon="🟢" || shred_icon="🟡"
+    if [ "$CLIENT" = firebam ]; then
+        # Datapoints with no FireBAM source: no health verdict, so no green/yellow.
+        neterr_icon="❔"; shred_icon="❔"
+        if [ "$fb_metrics_ok" = 1 ]; then
+            # From :7999 (2026-10-26): NIC drops for the network, shred-tile results for reception.
+            [ "$rx_drops_delta" -le "$NET_ERR_DELTA_WARN" ] && neterr_icon="🟢" || neterr_icon="🟡"
+            fb_sh_bad=$(( fb_sh_rej + fb_sh_parse + fb_sh_equiv ))
+            if   [ "$fb_sh_acc" -le 0 ];   then shred_icon="🔴"
+            elif [ "$fb_sh_bad" -gt 0 ];   then shred_icon="🟡"
+            else shred_icon="🟢"; fi
+        fi
+        # From :7999 and /proc (2026-10-26): peers, CPU (busiest tile), memory.
+        [ "$fb_metrics_ok" = 1 ] || peers_icon="❔"
+        if [ "$fb_metrics_ok" != 1 ]; then cpu_icon="❔"
+        elif awk -v b="${fb_busy_max:-0}" 'BEGIN{exit !(b>=90)}'; then cpu_icon="🟡"
+        else cpu_icon="🟢"; fi
+    fi
 
     if [ "$bam_present" = 1 ] && [ "$bam_unhealthy" -eq 0 ] && [ "$bam_out_fail" -eq 0 ]; then
         bam_icon="🟢"
@@ -1060,8 +1660,11 @@ while true; do
     if awk -v d=$drop_rate -v w=$BLOCK_DROP_RATE_WARN 'BEGIN{exit !(d>w)}'; then
         drop_icon="🟡"
     fi
+    [ "$CLIENT" = firebam ] && drop_icon="❔"   # no blocks_produced datapoint on FireBAM
 
-    # Leader proximity
+    # Leader proximity. FireBAM has no "My next leader slot is" log line: use the
+    # RPC leader schedule instead (0 when the schedule is not available).
+    [ "$CLIENT" = firebam ] && my_next_leader=$next_leader_abs
     leader_distance=$(awk -v n=$my_next_leader -v p=$processed 'BEGIN{d=n-p; if(d<0)d=0; print d}')
     if   [ "$leader_distance" -le 4 ] && [ "$my_next_leader" -gt 0 ]; then leader_icon="🎯"
     elif [ "$leader_distance" -le 32 ]; then leader_icon="🟢"
@@ -1100,7 +1703,7 @@ while true; do
 
     # ---- Render ----
     [ "$RUN_ONCE" != true ] && clear
-    echo "🔍 Agave Validator Monitor (mainnet) — $(date '+%Y-%m-%d %H:%M:%S')"
+    echo "🔍 Validator Monitor v$SCRIPT_VERSION ($NETWORK, $CLIENT) — $(date '+%Y-%m-%d %H:%M:%S')"
     echo "============================================================"
     # Role tag: compare the live identity to the staked (leader) identity so a
     # glance shows whether this host is ACTIVE or the hot spare.
@@ -1114,11 +1717,33 @@ while true; do
     fi
     echo "🆔 Identity:   ${IDENTITY_PUBKEY:-?}${identity_role}"
     echo "🗳️  Vote:       ${VOTE_PUBKEY}"
-    echo "📦 Version:    agave-validator $sol_version${val_client:+ (client:$val_client)} | feature-set $feature_set | health $health_icon $health"
+    if [ "$CLIENT" = firebam ]; then
+        echo "📦 Version:    firebam ${fb_version:-$sol_version} | solana-core $sol_version | feature-set $feature_set | health $health_icon $health"
+        if grep -qE '^\s*alpenglow\s*=\s*true' "$HOME/firebam/firedancer.toml" 2>/dev/null; then
+            # FireBAM's votor_* metrics (:7999). No fast/slow finalization split exists
+            # there (nor in its log), so the Agave "N/M fast" form has no source.
+            if [ "${fb_metrics_ok:-0}" = 1 ]; then
+                fb_vt_warn=""
+                [ $(( fb_vt_slashable + fb_vt_sigfail )) -gt 0 ] && fb_vt_warn=" ⚠️  slashable ${fb_vt_slashable} / sig-failed ${fb_vt_sigfail} since boot"
+                echo "⚙️  Consensus:  🌅 Alpenglow Votor (FireBAM) — final #$(fmt $fb_final_cert) | +$(fmt $fb_vt_votes) votes, +$(fmt $fb_vt_certs) certs /cycle | $(fmt $fb_vt_peers) votor peers${fb_vt_warn}"
+            else
+                echo "⚙️  Consensus:  🌅 Alpenglow Votor (FireBAM config; :7999 not answering)"
+            fi
+        else
+            echo "⚙️  Consensus:  TowerBFT (FireBAM config)"
+        fi
+    else
+        echo "📦 Version:    agave-validator $sol_version${val_client:+ (client:$val_client)} | feature-set $feature_set | health $health_icon $health"
+        if [ "$votor_active" = true ]; then
+            echo "⚙️  Consensus:  🌅 Alpenglow Votor (${ag_finalized_fast}/${ag_finalized_count} fast finalizations in tail)"
+        else
+            echo "⚙️  Consensus:  TowerBFT"
+        fi
+    fi
     echo "📅 Epoch:      $epoch | slot $slot_index of $(fmt $slots_in_epoch) (${epoch_pct}%)"
     echo "⏱️  Uptime:     $uptime_display"
     echo "🐧 OS:         $os_pretty | kernel $kernel_version"
-    [ "$RUN_ONCE" != true ] && echo "⌨️  Toggle: 1-9/0 sections · s services · y system · a expand-all · z collapse-all · q quit"
+    [ "$RUN_ONCE" != true ] && echo "⌨️  Toggle: 1-9/0 sections · f FireBAM · s services · y system · a expand-all · z collapse-all · q quit"
     echo ""
     echo "┌─ $(sec_tag slot 1)📊 Slot Status: $proc_icon $proc_status"
     if ! is_collapsed slot; then
@@ -1126,30 +1751,82 @@ while true; do
     printf "│   ├─ Confirmed:        %s (-%s behind processed)\n"  "$(fmt $confirmed)" "$(fmt $confirm_lag)"
     printf "│   ├─ Finalized:        %s %s (-%s behind, +%d/cycle)\n" "$(fmt $finalized)" "$final_dicon" "$(fmt $final_lag)" "$final_delta"
     printf "│   ├─ Cluster tip*:     %s (-%s behind)\n" "$(fmt $cluster_tip)" "$(fmt $cluster_lag)"
+    if _outside_on; then
+        if [ "$ext_ok" = 1 ]; then
+            printf "│   ├─ %s Outside view:   processed %s / finalized %s — %s @ %s\n" \
+                "$ext_icon" "$(fmt $ext_processed)" "$(fmt $ext_finalized)" "$ext_rel" "$CLUSTER_RPC_LABEL"
+        elif [ "$ext_ts" -gt 0 ]; then
+            printf "│   ├─ %s Outside view:   unreachable @ %s (last good %ss ago, tip %s)\n" \
+                "$ext_icon" "$CLUSTER_RPC_LABEL" "$((now_epoch - ext_ts))" "$(fmt $ext_processed)"
+        else
+            printf "│   ├─ %s Outside view:   unreachable @ %s\n" "$ext_icon" "$CLUSTER_RPC_LABEL"
+        fi
+    fi
+    if [ "$max_retx" -gt 0 ] || [ "$max_shred" -gt 0 ]; then   # alpenglow host only
+    printf "│   ├─ Max retransmit:   %s | Max shred insert: %s\n" "$(fmt $max_retx)" "$(fmt $max_shred)"
+    fi
     printf "│   └─ Block height:     %s\n" "$(fmt $block_height)"
     echo "│      * max(lastVote) across current vote accounts"
     fi
     echo "│"
     echo "├─ $(sec_tag consensus 2)🔗 Consensus: $root_icon $root_status"
     if ! is_collapsed consensus; then
+    if [ "$CLIENT" = firebam ]; then
+    na_row "New root (log)"
+    printf "│   ├─ Root (RPC final): %s %s (+%d/cycle, stall %ds)\n" \
+        "$(fmt $new_root_max)" "$root_dicon" "$root_delta" "$root_stall"
+    na_row "Tower latest"
+    na_row "Tower observed"
+    printf "│   ├─ Last vote (RPC):  %s (root slot %s)\n" "$(fmt $me_last_vote)" "$(fmt $me_root_slot)"
+    na_row "Vote reception"
+    na_row "Bank frozen"
+    na_row "Optimistic slot"
+    na_row "Fork weight"
+    na_row "Dup confirm"
+    na_row "Hi super-maj root" last
+    else
     printf "│   ├─ New root (log):   %s %s (+%d/cycle, %d roots in tail, stall %ds)\n" \
         "$(fmt $new_root_max)" "$root_dicon" "$root_delta" "$new_root_count" "$root_stall"
+    if [ "$tower_latest" -gt 0 ] || [ "$votor_active" = false ]; then
     printf "│   ├─ Tower latest:     %s (root %s)\n" "$(fmt $tower_latest)" "$(fmt $tower_root)"
     printf "│   ├─ Tower observed:   slot %s (root %s)\n" "$(fmt $tobs_slot)" "$(fmt $tobs_root)"
+    fi
+    if [ "$votor_active" = true ]; then
+        votor_icon="🟢"
+        [ "$ag_timeout_crash_count" -gt 0 ] && votor_icon="🟡"
+        [ "$ag_standstill_count" -gt 0 ] && votor_icon="🔴"
+        printf "│   ├─ %s Votor:         finalized=%d (fast=%d) notar=%d notar-fb=%d skip-votes=%d timeout-crash=%d standstill=%d\n" \
+            "$votor_icon" "$ag_finalized_count" "$ag_finalized_fast" "$ag_notar_count" "$ag_notar_fb_count" \
+            "$ag_skip_vote_count" "$ag_timeout_crash_count" "$ag_standstill_count"
+        pool_icon="🟢"
+        [ "$cp_conflict" -gt 0 ] && pool_icon="🟡"
+        [ "$cps_standstill" = "true" ] && pool_icon="🔴"
+        printf "│   ├─ %s Consensus pool: votes=%s certs=%s conflicting=%s | sent=%s dropped=%s standstill=%s\n" \
+            "$pool_icon" "$(fmt $cp_incoming_votes)" "$(fmt $cp_incoming_certs)" "$(fmt $cp_conflict)" \
+            "$(fmt $cps_certs_sent)" "$(fmt $cps_certs_dropped)" "$cps_standstill"
+    fi
     printf "│   ├─ Last vote (RPC):  %s (root slot %s)\n" "$(fmt $me_last_vote)" "$(fmt $me_root_slot)"
-    printf "│   ├─ Vote reception:   %s/sample %s\n" "$(fmt $vote_rx)" "$vote_rx_icon"
+    # TowerBFT-only rows: vote txs, optimistic confirmation and fork weight do not exist under Votor.
+    [ "$votor_active" = false ] && printf "│   ├─ Vote reception:   %s/sample %s\n" "$(fmt $vote_rx)" "$vote_rx_icon"
     printf "│   ├─ Bank frozen:      %s\n" "$(fmt $frozen_slot)"
+    if [ "$votor_active" = false ]; then
     printf "│   ├─ Optimistic slot:  %s\n" "$(fmt $optimistic_slot)"
     printf "│   ├─ Fork weight:      %s\n" "$fork_weight"
     printf "│   ├─ Dup confirm:      %sms\n" "$dup_confirm_ms"
+    fi
     printf "│   └─ Hi super-maj root:%s (confirmed %s, agg %dms)\n" \
         "$(fmt $hsmr)" "$(fmt $hcs)" "$agg_ms"
+    fi
     fi
     echo "│"
     echo "├─ $(sec_tag leader 3)🏛️  Leader / Block Production: $leader_icon $drop_icon"
     if ! is_collapsed leader; then
+    if [ "$CLIENT" = firebam ] && [ "$my_next_leader" -le 0 ]; then
+        na_row "My next leader"
+    else
     printf "│   ├─ My next leader:   %s (cur slot %s → %s away)\n" \
         "$(fmt $my_next_leader)" "$(fmt $processed)" "$leader_distance"
+    fi
     if [ "$next_leader_abs" -gt 0 ]; then
         printf "│   ├─ Next leader at:   slot %s in %s — %s / %s\n" \
             "$(fmt $next_leader_abs)" "$(fmt_eta $next_leader_eta_secs)" \
@@ -1168,6 +1845,16 @@ while true; do
     fi
     printf "│   ├─ My last leader:   slot %s ; window slots in tail: %d\n" \
         "$(fmt $my_last_leader_slot)" "$my_leader_slots_in_tail"
+    if [ "$CLIENT" = firebam ]; then
+    na_row "Block build"
+    na_row "Last leader chg"
+    na_row "Leader changes"
+    na_row "Blocks on fork"
+    na_row "Dropped blocks"
+    printf "│   ├─ Replay tip:       slot %s %s (+%d/cycle)\n" \
+        "$(fmt $replay_slot)" "$replay_dicon" "$replay_slot_delta"
+    na_row "Last snapshot" last
+    else
     if [ "$have_build" = 1 ] && [ "$build_from_history" = 1 ]; then
         # Build recovered from beyond the recent tail — its banking/poh internals
         # aren't in the tail, so report only the build itself with how long ago.
@@ -1192,7 +1879,24 @@ while true; do
         "$(fmt $replay_slot)" "$replay_dicon" "$replay_slot_delta" "$(fmt $replay_tx)" "$replay_us"
     printf "│   └─ Last snapshot:    📸 %s at slot %s\n" "$snap_kind" "$(fmt $snap_slot)"
     fi
+    fi
     echo "│"
+    if [ "$CLIENT" = firebam ]; then
+    # FireBAM: only the fee facts of OUR leader slots (firebam-log-view.py); no tx/CU counts.
+    echo "├─ $(sec_tag latest 4)📦 Latest Leader Slot (#$([ "$cost_slot" -gt 0 ] && fmt $cost_slot || echo n/a))"
+    if ! is_collapsed latest; then
+    na_row "Transactions"
+    na_row "Block cost"
+    na_row "Vote cost"
+    if [ "$cost_slot" -gt 0 ]; then
+    printf "│   ├─ Total fee:        %s lamports %s\n" "$(fmt $cost_fee)" "$(arrow $cost_fee $prev_cost_fee)"
+    printf "│   └─ Priority fee:     %s lamports %s\n" "$(fmt $cost_priority)" "$(arrow $cost_priority $prev_cost_priority)"
+    else
+    na_row "Total fee"
+    na_row "Priority fee" last
+    fi
+    fi
+    else
     echo "├─ $(sec_tag latest 4)📦 Latest Slot (#$(fmt $cost_slot))"
     if ! is_collapsed latest; then
     printf "│   ├─ Transactions:     %s (%s sigs) %s\n" "$(fmt $cost_txns)" "$(fmt $cost_sigs)" "$(arrow $cost_txns $prev_cost_txns)"
@@ -1201,6 +1905,7 @@ while true; do
     printf "│   ├─ Total fee:        %s lamports %s\n" "$(fmt $cost_fee)" "$(arrow $cost_fee $prev_cost_fee)"
     printf "│   └─ Priority fee:     %s lamports %s\n" "$(fmt $cost_priority)" "$(arrow $cost_priority $prev_cost_priority)"
     fi
+    fi
     echo "│"
     if [ -n "$me_present" ]; then
         echo "├─ $(sec_tag vote 5)🗳️  Vote Account: $vote_icon $vote_status"
@@ -1208,9 +1913,32 @@ while true; do
         printf "│   ├─ Activated stake:  %s SOL (%s%% of %s SOL active)\n" \
             "$(fmt $me_stake_sol)" "$stake_share_pct" "$(fmt $total_stake_sol)"
         printf "│   ├─ Commission:       %s%%\n" "$me_commission"
-        printf "│   ├─ Epoch credits:    %s (prev epoch %s)\n" "$(fmt $me_credits)" "$(fmt $me_prev_credits)"
-        printf "│   ${vl_color}├─ ▶ Vote lag:       %s slots behind cluster %s (Δ%+d/cycle, warn>%d crit>%d delinq~128) ◀${vl_reset}\n" \
-            "$(fmt $vote_lag)" "$vote_lag_dicon" "$vote_lag_delta" "$VOTE_LAG_WARN" "$VOTE_LAG_CRIT"
+        printf "│   ├─ Epoch credits:    %s this epoch (prev epoch %s)\n" "$(fmt $me_credits)" "$(fmt $me_prev_credits)"
+        if [ "$vote_lag" -gt 0 ]; then
+            vl_peers="$peers_as_far_behind of $current_count validators ≥${vote_lag} behind"
+        else
+            vl_peers="at cluster max"
+        fi
+        printf "│   ${vl_color}├─ ▶ Vote lag:       %s slots behind cluster max (%s) %s (Δ%+d/cycle, warn>%d crit>%d delinq~128) ◀${vl_reset}\n" \
+            "$(fmt $vote_lag)" "$vl_peers" "$vote_lag_dicon" "$vote_lag_delta" "$VOTE_LAG_WARN" "$VOTE_LAG_CRIT"
+        if [ "$CLIENT" = firebam ]; then
+            if [ "$last_vote_list_refresh" -gt 0 ]; then
+                printf "│   ├─ Cluster list:     from %s, %ss old (refreshed every %ss; FireBAM has no local getVoteAccounts)\n" \
+                    "$CLUSTER_RPC_LABEL" "$((now_epoch - last_vote_list_refresh))" "$VOTE_LIST_REFRESH"
+            else
+                printf "│   ├─ Cluster list:     unavailable (FireBAM has no local getVoteAccounts; no CLUSTER_RPC_URL reply)\n"
+            fi
+        fi
+        if _outside_on; then
+            # The cluster's own opinion of us — the signal that matters for
+            # rewards, and the one our local node can be wrong about.
+            if [ "$ext_vote_ts" -gt 0 ]; then
+                printf "│   ├─ %s Outside says:   %s (lastVote %s, checked %ss ago) @ %s\n" \
+                    "$ext_vote_icon" "$ext_me_state" "$(fmt $ext_me_last_vote)" "$((now_epoch - ext_vote_ts))" "$CLUSTER_RPC_LABEL"
+            else
+                printf "│   ├─ %s Outside says:   %s @ %s\n" "$ext_vote_icon" "$ext_me_state" "$CLUSTER_RPC_LABEL"
+            fi
+        fi
         printf "│   └─ Cluster vote acct:%d active / %d delinquent (%s%% stake delinquent)\n" \
             "$current_count" "$delinquent_count" "$delinq_pct"
         fi
@@ -1231,29 +1959,77 @@ while true; do
     echo "│"
     echo "├─ $(sec_tag shred 7)📡 Shred Reception: $shred_icon"
     if ! is_collapsed shred; then
+    if [ "$CLIENT" = firebam ] && [ "$fb_metrics_ok" = 1 ]; then
+    # FireBAM shred tile (:7999), per cycle. No per-slot insert latency source.
+    printf "│   ├─ Shreds accepted:  %s (FEC sets completed %s) per cycle\n" "$(fmt $fb_sh_acc)" "$(fmt $fb_sh_fec)"
+    printf "│   ├─ Repair received:  %s | duplicates %s\n" "$(fmt $fb_sh_repair)" "$(fmt $fb_sh_dup)"
+    printf "│   └─ Problems:         rejected %s | parse failed %s | equivocated %s\n" \
+        "$(fmt $fb_sh_rej)" "$(fmt $fb_sh_parse)" "$(fmt $fb_sh_equiv)"
+    elif [ "$CLIENT" = firebam ]; then
+    na_row "Latest slot"
+    na_row "Avg latency"
+    na_row "Repair/recover" last
+    else
     printf "│   ├─ Latest slot:      #%s (%sms, last_index %s)\n" "$(fmt $shred_slot)" "$shred_time_ms" "$shred_last_idx"
     printf "│   ├─ Avg latency:      %sms (last 10 inserts) %s\n" "$shred_avg" "$(arrow $shred_avg $prev_shred_avg)"
     printf "│   └─ Repaired:         %s | Recovered: %s\n" "$shred_repaired" "$shred_recovered"
+    fi
     fi
     echo "│"
     if [ "$bam_present" = 1 ]; then
         echo "├─ $(sec_tag bam 8)🔲 BAM (Jito): $bam_icon"
         if ! is_collapsed bam; then
         printf "│   ├─ Bundles recv:     %s\n" "$(fmt $bam_bundles)"
-        printf "│   ├─ Heartbeats:       recv=%s sent=%s\n" "$(fmt $bam_hb_recv)" "$(fmt $bam_hb_sent)"
+        # The FireBAM metrics row carries no heartbeat_sent column.
+        printf "│   ├─ Heartbeats:       recv=%s sent=%s\n" "$(fmt $bam_hb_recv)" "$([ "$CLIENT" = firebam ] && echo n/a || fmt $bam_hb_sent)"
         printf "│   ├─ Fwd failures:     %s | Outbound fail: %s\n" "$(fmt $bam_fwd_fail)" "$(fmt $bam_out_fail)"
         printf "│   └─ Unhealthy count:  %s\n" "$bam_unhealthy"
         fi
         echo "│"
     fi
+    if [ "$CLIENT_LABEL" = FireBAM ]; then
+        if [ "$fb_metrics_ok" = 1 ]; then
+            fb_cert_delta=$(( fb_final_cert - ${prev_fb_final_cert:-$fb_final_cert} ))
+            [ "$fb_caught_up" = 1 ] && fb_icon="🟢" || fb_icon="🔴"
+            echo "├─ $(sec_tag fd f)🔥 FireBAM metrics (127.0.0.1:7999): $fb_icon"
+            if ! is_collapsed fd; then
+            printf "│   ├─ Votor:            final cert #%s (+%s/cycle) | wait-to-vote #%s | %s\n" \
+                "$(fmt $fb_final_cert)" "$fb_cert_delta" "$(fmt $fb_wait_vote)" "$fb_role"
+            printf "│   ├─ Vote history:     %s file writes | pool slots %s used / %s free\n" \
+                "$(fmt $fb_vh_writes)" "$fb_pool_used" "$fb_pool_free"
+            printf "│   ├─ Replay:           caught up %s | accounts %s / %s (%s%% of max_accounts)\n" \
+                "$( [ "$fb_caught_up" = 1 ] && echo yes || echo NO )" "$(fmt $fb_acc_used)" "$(fmt $fb_acc_cap)" \
+                "$(awk -v u=$fb_acc_used -v c=$fb_acc_cap 'BEGIN{printf "%.1f", (c?u*100/c:0)}')"
+            printf "│   ├─ Gossip peers:     %s staked / %s unstaked\n" "$(fmt $fb_peers_staked)" "$(fmt $fb_peers_unstaked)"
+            printf "│   ├─ Busiest tiles:    %s (%s)\n" "${fb_tile_report:-n/a}" "$fb_tile_src"
+            printf "│   ├─ Backpressure max: %s%% (%s)\n" "${fb_bp_max:-0}" "${fb_bp_max_tile:-n/a}"
+            printf "│   └─ BAM healthy:      %s\n" "$( [ "$fb_bam_healthy" = 1 ] && echo yes || echo no )"
+            fi
+        else
+            echo "├─ $(sec_tag fd f)🔥 FireBAM metrics: 🔴 127.0.0.1:7999 not answering (starting or down)"
+        fi
+        echo "│"
+    fi
     echo "├─ $(sec_tag net 9)🌐 Network: $neterr_icon"
     if ! is_collapsed net; then
+    if [ "$CLIENT" = firebam ] && [ "$fb_metrics_ok" = 1 ]; then
+    # From :7999: gossip peers and FireBAM's own NIC counters (XDP bypasses the kernel's).
+    printf "│   ├─ %s Cluster nodes:  %s (%s staked, gossip CRDS)\n" "$peers_icon" "$(fmt $cluster_nodes)" "$cluster_staked"
+    printf "│   ├─ Traffic:          rx %s KiB / tx %s KiB | pkts rx %s / tx %s (FireBAM NIC, per cycle)\n" \
+        "$rx_kbps" "$tx_kbps" "$(fmt $rx_pkts_delta)" "$(fmt $tx_pkts_delta)"
+    printf "│   └─ Errors (delta):   rx_drops=%s (FireBAM NIC)\n" "$(fmt $rx_drops_delta)"
+    elif [ "$CLIENT" = firebam ]; then
+    na_row "Cluster nodes"
+    na_row "Traffic"
+    na_row "Errors (delta)" last
+    else
     printf "│   ├─ %s Cluster nodes:  %s (%s staked, %s dead, %s stale)\n" \
         "$peers_icon" "$(fmt $cluster_nodes)" "$cluster_staked" "$cluster_dead" "$cluster_stale"
     printf "│   ├─ Traffic:          rx %s KiB / tx %s KiB | pkts rx %s / tx %s\n" \
         "$rx_kbps" "$tx_kbps" "$(fmt $rx_pkts_delta)" "$(fmt $tx_pkts_delta)"
     printf "│   └─ Errors (delta):   in_err=%s rcvbuf_err=%s rx_drops=%s\n" \
         "$(fmt $in_err_delta)" "$(fmt $rcv_err_delta)" "$(fmt $rx_drops_delta)"
+    fi
     fi
     echo "│"
     echo "├─ $(sec_tag dz 0)⚡ DoubleZero: $dz_icon $cached_dz_status"
@@ -1272,6 +2048,20 @@ while true; do
     echo "│"
     echo "└─ $(sec_tag sys y)🖥️  System Health:"
     if ! is_collapsed sys; then
+    if [ "$CLIENT" = firebam ]; then
+    # /proc + sysfs + :7999 (2026-10-26). Accounts cache/data/banks are Agave
+    # datapoints; FireBAM's accounts index is in the FireBAM section.
+    printf "    ├─ CPU load 1/5/15:  %s / %s / %s (cores=%s, threads=%s) — not a signal on FireBAM\n" \
+        "$load1" "$load5" "$load15" "$cpu_num" "$(fmt $threads)"
+    printf "    ├─ %s Tile CPU:        busiest %s%% (%s)\n" "$cpu_icon" "${fb_busy_max:-?}" "${fb_busy_max_tile:-n/a}"
+    printf "    ├─ %s Memory:          %s%% free / %s%% available (used %s of %s GiB)\n" \
+        "$mem_icon" "$mem_free_pct_fmt" "$mem_avail_pct_fmt" \
+        "$(awk -v b=$mem_used 'BEGIN{printf "%.1f", b/1073741824}')" \
+        "$(awk -v b=$mem_total 'BEGIN{printf "%.1f", b/1073741824}')"
+    printf "    ├─ Hugepages:        1 GiB: %s / %s in use | 2 MiB: %s / %s in use (FireBAM workspace)\n" \
+        "$fb_giant_used" "$fb_giant_total" "$fb_huge2_used" "$fb_huge2_total"
+    printf "    ├─ Accounts cache / data / banks: n/a (Agave datapoints; see the FireBAM section)\n"
+    else
     printf "    ├─ %s CPU load 1/5/15: %s / %s / %s (cores=%s, threads=%s, load1=%s%% of cores)\n" \
         "$cpu_icon" "$load1" "$load5" "$load15" "$cpu_num" "$(fmt $threads)" "$load_ratio"
     printf "    ├─ %s Memory:          %s%% free / %s%% available (used %s of %s GiB)\n" \
@@ -1282,6 +2072,7 @@ while true; do
         "$(human_bytes $cache_size)" "$(fmt $cache_accounts)" "$cache_slots"
     printf "    ├─ Accounts data:    %s\n" "$(human_bytes $accounts_data_len)"
     printf "    ├─ Active banks:     %s\n" "$root_banks"
+    fi
     printf "    ├─ Disk (ledger):    %s\n" "${disk_ledger:-?}"
     printf "    ├─ Disk (root):      %s\n" "${disk_root:-?}"
     printf "    └─ %s Log tail (%d lines): %d WARN, %d ERROR (+%d/+%d this cycle)\n" \
@@ -1308,15 +2099,25 @@ while true; do
     [ "$root_stall" -gt "$ROOT_STALL_CRIT" ] && issues=$((issues+1))
     [ "$me_delinquent" = "true" ] && issues=$((issues+1))
     [ -n "$me_present" ] && [ "$vote_lag" -gt "$VOTE_LAG_CRIT" ] && issues=$((issues+1))
-    [ "$cluster_staked" -lt "$MIN_PEERS_STAKED" ] && issues=$((issues+1))
+    { [ "$CLIENT" != firebam ] || [ "$fb_metrics_ok" = 1 ]; } && [ "$cluster_staked" -lt "$MIN_PEERS_STAKED" ] && issues=$((issues+1))
+    [ "$CLIENT" = firebam ] && [ "$fb_metrics_ok" = 1 ] && [ "$fb_caught_up" != 1 ] && issues=$((issues+1))
     [ "$svc_sol"   != "active" ] && issues=$((issues+1))
     [ "$svc_shred" != "active" ] && [ "$svc_shred" != "absent" ] && issues=$((issues+1))
     [ "$svc_dz"    != "active" ] && [ "$svc_dz"    != "absent" ] && issues=$((issues+1))
     [ "$cached_dz_status" = "DEGRADED" ] && issues=$((issues+1))
+    if _outside_on; then
+        [ "$ext_ok" != 1 ] && issues=$((issues+1))
+        [ "$ext_ok" = 1 ] && [ "$ext_lag" -gt "$PROC_LAG_CRIT" ] && issues=$((issues+1))
+        [ "$ext_me_state" = "delinquent" ] && issues=$((issues+1))
+    fi
     [ "$bam_present" = 1 ] && [ "$bam_unhealthy" -gt 0 ] && issues=$((issues+1))
 
     if [ "$prev_processed" = 0 ] && [ "$RUN_ONCE" != true ]; then
         echo "⏳ Status: Initializing..."
+    elif [ "$ext_me_state" = "delinquent" ] && [ "$me_delinquent" != "true" ]; then
+        # Outside disagreeing with local is worse than either alone: our node
+        # thinks it is voting, the cluster is not counting those votes.
+        echo "🚨 ALERT: $CLUSTER_RPC_LABEL reports our vote account DELINQUENT while the local view says active"
     elif [ "$me_delinquent" = "true" ]; then
         echo "🚨 ALERT: vote account is DELINQUENT"
     elif [ -n "$me_present" ] && [ "$vote_lag" -gt "$VOTE_LAG_CRIT" ]; then
@@ -1329,6 +2130,8 @@ while true; do
         echo "🚨 ALERT: processed slot $cluster_lag behind cluster tip"
     elif [ "$root_stall" -gt "$ROOT_STALL_CRIT" ]; then
         echo "🚨 ALERT: no new root for ${root_stall}s"
+    elif [ "$votor_active" = true ] && { [ "$ag_standstill_count" -gt 0 ] || [ "$cps_standstill" = "true" ]; }; then
+        echo "🚨 ALERT: Alpenglow Standstill (log events=$ag_standstill_count, in_standstill=$cps_standstill)"
     elif [ "$cached_dz_status" = "DEGRADED" ]; then
         echo "🚨 ALERT: DoubleZero tunnel(s) DOWN"
     elif [ $issues -gt 0 ]; then
@@ -1351,6 +2154,7 @@ while true; do
     prev_blocks_on_fork=$blocks_on_fork
     prev_dropped_blocks=$dropped_blocks
     prev_new_root_max=$new_root_max
+    prev_fb_final_cert=${fb_final_cert:-0}
     prev_replay_slot=$replay_slot
     prev_log_warn_count=$warn_count
     prev_log_error_count=$error_count

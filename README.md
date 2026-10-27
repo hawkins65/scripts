@@ -60,7 +60,6 @@ epoch is normal, not a fault.
 | `validator-monitor.sh` | Live terminal dashboard for an Agave/Jito node — vote reception, CPU and memory, network errors, shred latency, block build time, DoubleZero and shredstream health |
 | `my-leader-slots.sh` | List your leader slots for the current epoch |
 | `show-my-next-leader-slot.sh` | Time until your next leader slot |
-| `validator-monitor-credits.sh` | Track vote credits and flag shortfalls |
 | `sfdp_version_monitor.sh` | Watch client versions against SFDP requirements |
 | `collect-identity-balance.sh` | Record identity account balance over time |
 | `pubkey-to-name.sh` | Resolve a vote account to a validator name via the Trillium API |
