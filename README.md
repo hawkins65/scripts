@@ -57,7 +57,7 @@ epoch is normal, not a fault.
 
 | Script | What it does |
 |---|---|
-| `validator-monitor.sh` | Live terminal dashboard for an Agave/Jito node — vote reception, CPU and memory, network errors, shred latency, block build time, DoubleZero and shredstream health |
+| `validator-monitor.sh` | Live terminal dashboard for an Agave/Jito or FireBAM node (mainnet or testnet, auto-detected) — Alpenglow Votor finalization and Standstill alert, CPU and memory, network errors, shred latency, block build time, DoubleZero and shredstream health |
 | `my-leader-slots.sh` | List your leader slots for the current epoch |
 | `show-my-next-leader-slot.sh` | Time until your next leader slot |
 | `sfdp_version_monitor.sh` | Watch client versions against SFDP requirements |
